@@ -1,0 +1,4 @@
+Object,Required_Source_Env_When_Loaded,Policy,Notes
+Pricebook2,MCUAT8451,MCUAT_SOURCE_OF_TRUTH,"Do not overwrite MCUAT Pricebook2 from SF 1.0 Prod. For SF 2.0 Production migration, source Pricebook2 from SF 2.0 MCUAT."
+Product2,MCUAT8451,MCUAT_SOURCE_OF_TRUTH,"Do not overwrite MCUAT Product2 from SF 1.0 Prod. For SF 2.0 Production migration, source Product2 from SF 2.0 MCUAT."
+PricebookEntry,MCUAT8451,MCUAT_SOURCE_OF_TRUTH,"Do not overwrite MCUAT PricebookEntry from SF 1.0 Prod. For SF 2.0 Production migration, source PricebookEntry from SF 2.0 MCUAT."

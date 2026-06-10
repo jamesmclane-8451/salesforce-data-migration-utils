@@ -1,0 +1,6 @@
+Obj,Field,Reason
+CRMfusionDBR101__DupeBlocker_Log__c,,Operational duplicate-blocker log object; values are Salesforce exception text rather than migration data.
+dfsle__Log__c,,Operational DocuSign log object; values are integration error text rather than migration data.
+dlrs__LookupRollupSummaryLog__c,,Operational rollup helper log object; values are validation/error text rather than migration data.
+EmailMessage,TextBody,Email bodies can contain automated Salesforce exception emails and row-lock errors; omit from diff payload.
+EmailMessage,HtmlBody,Email HTML bodies can contain automated Salesforce exception emails and markup; omit from diff payload.

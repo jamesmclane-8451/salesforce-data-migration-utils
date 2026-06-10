@@ -1,0 +1,45 @@
+# Local environment and editor files
+.DS_Store
+.env
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Salesforce OAuth token caches
+token_store_*.json
+
+# Large/generated extract outputs
+mcuat_extract.csv
+mcuat_extract.feather
+mcuat_extract_parquet/
+prod_extract.csv
+prod_extract.feather
+prod_extract_parquet/
+extract_checkpoints/
+
+# Large/generated diff outputs and checkpoints
+diff.csv
+diff.feather
+diff_field_level.csv
+diff_cleaned_values.csv
+diff_excluded_rows.csv
+diff_diff_parts/
+diff_diff_parts_*/
+diff_audit_*.csv
+
+# Large/generated load outputs
+load_results*.csv
+pre_run_inactive_owner_replacements.csv
+
+# Runtime/error/audit artifacts
+field_extract_errors.csv
+metadata_field_diff.csv
+metadata_scope_removed_html_fields.csv
+metadata_scope_removed_salesforce_json_fields.csv
+validation_rule_bypass_backup_*.csv
+
+# Columnar data artifacts
+*.parquet
+*.feather
+

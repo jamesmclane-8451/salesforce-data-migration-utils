@@ -1,0 +1,7 @@
+Flask
+openpyxl
+pandas
+pyarrow
+python-dotenv
+requests
+simple-salesforce
