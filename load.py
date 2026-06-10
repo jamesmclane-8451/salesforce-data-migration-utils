@@ -359,6 +359,61 @@ def load_salesforce_diff_to_target(
                 print(f"Finished {target_object}: no selected sample records")
                 continue
 
+        if target_object == "OpportunityContactRole":
+            ocr_stats = load_opportunity_contact_role_diffs(
+                sf=sf,
+                target_env=target_env,
+                source_env=source_env,
+                checkpoint_root=checkpoint_root,
+                source_objects_by_target=source_objects_by_target,
+                field_mappings=field_mappings,
+                source_record_id_col=source_record_id_col,
+                target_record_id_col=target_record_id_col,
+                source_value_col=source_value_col,
+                source_load_value_col=source_load_value_col,
+                change_types=change_types,
+                selected_source_ids=selected_source_ids,
+                field_coverage_sample=field_coverage_sample,
+                sample_size_per_object=sample_size_per_object,
+                remaining_sample_size=(
+                    sample_size - total_attempted
+                    if sample_size is not None
+                    else None
+                ),
+                dry_run=dry_run,
+                target_extract_root=target_extract_root,
+                extract_lookup_cache=extract_external_id_lookup_cache,
+                salesforce_lookup_cache=external_id_lookup_cache,
+                current_load_record_ids=current_load_record_ids,
+                describe_cache=describe_cache,
+                processed_load_keys=processed_load_keys,
+                result_rows=result_rows,
+                fallback_to_salesforce=relationship_resolution_fallback_to_salesforce,
+                record_noop_skips=record_noop_skips,
+                batch_size=batch_size,
+                bulk_buffer=bulk_buffer,
+                opportunity_contact_role_cache=opportunity_contact_role_cache,
+            )
+            total_attempted += int(ocr_stats["attempted"])
+            object_attempted += int(ocr_stats["attempted"])
+            object_skipped_already_attempted += int(ocr_stats["resume_skipped"])
+            object_attempted_by_change_type.update(ocr_stats["by_change_type"])
+            if bulk_buffer is not None:
+                bulk_buffer.flush_target_object(target_object)
+
+            object_change_type_summary = ", ".join(
+                f"{change_type}={count}"
+                for change_type, count in sorted(object_attempted_by_change_type.items())
+            )
+            object_summary_parts = [
+                f"attempted={object_attempted}",
+                f"resume_skipped={object_skipped_already_attempted}",
+            ]
+            if object_change_type_summary:
+                object_summary_parts.append(object_change_type_summary)
+            print(f"Finished {target_object}: " + "; ".join(object_summary_parts))
+            continue
+
         for part_path in iter_record_diff_part_paths(checkpoint_root, source_objects):
             if sample_size is not None and total_attempted >= sample_size:
                 break
@@ -410,35 +465,6 @@ def load_salesforce_diff_to_target(
 
                 batch_rows = batch.to_pydict()
                 row_count = len(batch_rows["Obj"])
-                if target_object == "OpportunityContactRole":
-                    preload_opportunity_contact_role_natural_keys_for_batch(
-                        sf=sf,
-                        target_object=target_object,
-                        batch_rows=batch_rows,
-                        row_count=row_count,
-                        source_record_id_col=source_record_id_col,
-                        target_record_id_col=target_record_id_col,
-                        source_value_col=source_value_col,
-                        source_load_value_col=source_load_value_col,
-                        change_types=change_types,
-                        field_mappings=field_mappings,
-                        field_defs=field_defs,
-                        relationship_field_defs=relationship_field_defs,
-                        target_external_id_field=target_external_id_field,
-                        processed_load_keys=processed_load_keys,
-                        target_extract_root=target_extract_root,
-                        extract_lookup_cache=extract_external_id_lookup_cache,
-                        salesforce_lookup_cache=external_id_lookup_cache,
-                        current_load_record_ids=current_load_record_ids,
-                        describe_cache=describe_cache,
-                        fallback_to_salesforce=relationship_resolution_fallback_to_salesforce,
-                        opportunity_contact_role_cache=opportunity_contact_role_cache,
-                        extra_field_names=[
-                            field_name
-                            for field_name in ("Role", "Opportunity_Contact_Role_Id__c")
-                            if field_name in field_defs
-                        ],
-                    )
 
                 for row_index in range(row_count):
                     if sample_size is not None and total_attempted >= sample_size:
@@ -1629,6 +1655,542 @@ def iter_load_diff_rows_for_target_object(
                     ),
                     "change_type": change_type,
                 }
+
+
+def load_opportunity_contact_role_diffs(
+    sf,
+    target_env: str,
+    source_env: str,
+    checkpoint_root: Path,
+    source_objects_by_target: Dict[str, Set[str]],
+    field_mappings: Dict[Tuple[str, str], List[Dict[str, Any]]],
+    source_record_id_col: str,
+    target_record_id_col: str,
+    source_value_col: str,
+    source_load_value_col: str,
+    change_types: Set[str],
+    selected_source_ids: Set[str],
+    field_coverage_sample: bool,
+    sample_size_per_object: Optional[int],
+    remaining_sample_size: Optional[int],
+    dry_run: bool,
+    target_extract_root: Optional[Path],
+    extract_lookup_cache: Dict[str, Dict[str, str]],
+    salesforce_lookup_cache: Dict[Tuple[str, str], Optional[str]],
+    current_load_record_ids: Dict[Tuple[str, str], str],
+    describe_cache: Dict[str, Dict[str, Any]],
+    processed_load_keys: Set[Tuple[str, str]],
+    result_rows,
+    fallback_to_salesforce: bool,
+    record_noop_skips: bool,
+    batch_size: int,
+    bulk_buffer: Optional[BulkOperationBuffer],
+    opportunity_contact_role_cache: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    target_object = "OpportunityContactRole"
+    describe = get_object_describe(sf, target_object, describe_cache)
+    field_defs = {
+        field_def["name"]: field_def
+        for field_def in describe.get("fields", [])
+        if field_def.get("name")
+    }
+    relationship_field_defs = {
+        str(field_def.get("relationshipName")).strip(): field_def
+        for field_def in field_defs.values()
+        if field_def.get("relationshipName")
+    }
+    target_external_id_field = field_defs.get("External_Id__c")
+    operation_hint = "create"
+    stats: Dict[str, Any] = {
+        "attempted": 0,
+        "resume_skipped": 0,
+        "by_change_type": Counter(),
+    }
+    pending_update_ids: Set[str] = set()
+    pending_create_pairs: Set[Tuple[str, str]] = set()
+    candidate_batch: List[Dict[str, Any]] = []
+    candidate_batch_size = max(1000, min(batch_size, 10000))
+
+    def sample_limit_reached() -> bool:
+        if remaining_sample_size is not None and stats["attempted"] >= remaining_sample_size:
+            return True
+        if (
+            not field_coverage_sample
+            and sample_size_per_object is not None
+            and stats["attempted"] >= sample_size_per_object
+            and not has_pending_source_ids(
+                target_object=target_object,
+                selected_source_ids=selected_source_ids,
+                processed_load_keys=processed_load_keys,
+            )
+        ):
+            return True
+        return False
+
+    def should_process_source_id(source_record_id: Optional[str]) -> bool:
+        clean_source_record_id = normalize_blank(source_record_id)
+        if not clean_source_record_id:
+            return False
+        if field_coverage_sample:
+            return clean_source_record_id in selected_source_ids
+        if clean_source_record_id in selected_source_ids:
+            return True
+        if sample_size_per_object is None:
+            return True
+        return stats["attempted"] < sample_size_per_object
+
+    def mark_attempted(change_type: str) -> None:
+        stats["attempted"] += 1
+        stats["by_change_type"][change_type] += 1
+
+    def append_result(
+        candidate: Dict[str, Any],
+        operation: str,
+        success: bool,
+        payload: Dict[str, Any],
+        skipped_fields: List[str],
+        message: str,
+        target_record_id: Optional[str] = None,
+    ) -> None:
+        result_rows.append(
+            build_result_row(
+                target_env=target_env,
+                source_env=source_env,
+                target_object=target_object,
+                source_object=candidate["source_object"],
+                source_record_id=candidate["source_record_id"],
+                target_record_id=target_record_id or candidate.get("target_record_id"),
+                change_type=candidate["change_type"],
+                operation=operation,
+                dry_run=dry_run,
+                success=success,
+                payload=payload,
+                skipped_fields=skipped_fields,
+                message=message,
+            )
+        )
+        processed_load_keys.add((target_object, candidate["source_record_id"]))
+        mark_attempted(candidate["change_type"])
+
+    def queue_or_execute(
+        candidate: Dict[str, Any],
+        operation: str,
+        target_record_id: Optional[str],
+        payload: Dict[str, Any],
+        skipped_fields: List[str],
+        natural_key: Tuple[str, str],
+    ) -> None:
+        nonlocal pending_update_ids, pending_create_pairs
+
+        if bulk_buffer is not None and not dry_run:
+            if operation == "update" and target_record_id:
+                if target_record_id in pending_update_ids:
+                    bulk_buffer.flush_target_object(target_object)
+                    pending_update_ids.clear()
+                    pending_create_pairs.clear()
+                pending_update_ids.add(target_record_id)
+            elif operation == "create":
+                if natural_key in pending_create_pairs:
+                    bulk_buffer.flush_target_object(target_object)
+                    pending_update_ids.clear()
+                    pending_create_pairs.clear()
+                pending_create_pairs.add(natural_key)
+
+            bulk_buffer.add(
+                target_object=target_object,
+                source_object=candidate["source_object"],
+                source_record_id=candidate["source_record_id"],
+                target_record_id=target_record_id,
+                change_type=candidate["change_type"],
+                operation=operation,
+                payload=payload,
+                skipped_fields=skipped_fields,
+            )
+            processed_load_keys.add((target_object, candidate["source_record_id"]))
+            mark_attempted(candidate["change_type"])
+            return
+
+        result_row = execute_or_preview_operation(
+            sf=sf,
+            target_env=target_env,
+            source_env=source_env,
+            target_object=target_object,
+            source_object=candidate["source_object"],
+            source_record_id=candidate["source_record_id"],
+            target_record_id=target_record_id,
+            change_type=candidate["change_type"],
+            operation=operation,
+            payload=payload,
+            skipped_fields=skipped_fields,
+            dry_run=dry_run,
+            single_record_reason="Bulk API disabled; OCR handler still uses natural-key classification",
+        )
+        result_rows.append(result_row)
+        remember_loaded_record_id(
+            result_row=result_row,
+            target_object=target_object,
+            source_record_id=candidate["source_record_id"],
+            current_load_record_ids=current_load_record_ids,
+        )
+        if str(result_row.get("Success", "")).upper() == "TRUE":
+            remember_opportunity_contact_role_cache_from_operation(
+                operation_row={
+                    "payload": payload,
+                    "source_record_id": candidate["source_record_id"],
+                },
+                result_row=result_row,
+                opportunity_contact_role_cache=opportunity_contact_role_cache,
+            )
+        processed_load_keys.add((target_object, candidate["source_record_id"]))
+        mark_attempted(candidate["change_type"])
+
+    def build_candidate(diff_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        source_record_id = normalize_blank(diff_row.get("source_record_id"))
+        if not source_record_id:
+            return None
+        load_key = (target_object, source_record_id)
+        if load_key in processed_load_keys:
+            stats["resume_skipped"] += 1
+            return None
+        if not should_process_source_id(source_record_id):
+            return None
+
+        source_payload = merge_load_payload(
+            source_payload=diff_row.get("source_payload") or {},
+            source_load_payload=diff_row.get("source_load_payload") or {},
+        )
+        mapped_payload, skipped_fields = map_source_payload_to_target(
+            source_object=normalize_blank(diff_row.get("source_object")) or "",
+            source_payload=source_payload,
+            target_object=target_object,
+            field_mappings=field_mappings,
+            field_defs=field_defs,
+            relationship_field_defs=relationship_field_defs,
+            operation_hint=operation_hint,
+        )
+        candidate = {
+            "source_object": normalize_blank(diff_row.get("source_object")) or "",
+            "source_record_id": source_record_id,
+            "target_record_id": normalize_blank(diff_row.get("target_record_id")),
+            "change_type": normalize_blank(diff_row.get("change_type")) or "",
+            "payload": mapped_payload,
+            "skipped_fields": skipped_fields,
+        }
+        if not mapped_payload:
+            append_result(
+                candidate=candidate,
+                operation="skip",
+                success=False,
+                payload={},
+                skipped_fields=skipped_fields,
+                message="No writable mapped fields for OpportunityContactRole",
+            )
+            return None
+        return candidate
+
+    def resolve_candidate_parents(candidate: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        payload = candidate["payload"]
+        source_opportunity_id = get_reference_external_id_from_payload(
+            payload=payload,
+            relationship_field_defs=relationship_field_defs,
+            field_name="OpportunityId",
+            default_relationship_name="Opportunity",
+        )
+        source_contact_id = get_reference_external_id_from_payload(
+            payload=payload,
+            relationship_field_defs=relationship_field_defs,
+            field_name="ContactId",
+            default_relationship_name="Contact",
+        )
+        if not source_opportunity_id or not source_contact_id:
+            append_result(
+                candidate=candidate,
+                operation="skip",
+                success=False,
+                payload={},
+                skipped_fields=candidate["skipped_fields"],
+                message=(
+                    "Cannot load OpportunityContactRole because source Opportunity "
+                    "or Contact reference is blank"
+                ),
+            )
+            return None
+
+        target_opportunity_id = resolve_target_record_id_from_external_id(
+            object_name="Opportunity",
+            external_id_value=source_opportunity_id,
+            existing_target_record_id=None,
+            sf=sf,
+            describe_cache=describe_cache,
+            target_extract_root=target_extract_root,
+            extract_lookup_cache=extract_lookup_cache,
+            salesforce_lookup_cache=salesforce_lookup_cache,
+            current_load_record_ids=current_load_record_ids,
+            fallback_to_salesforce=fallback_to_salesforce,
+        )
+        target_contact_id = resolve_target_record_id_from_external_id(
+            object_name="Contact",
+            external_id_value=source_contact_id,
+            existing_target_record_id=None,
+            sf=sf,
+            describe_cache=describe_cache,
+            target_extract_root=target_extract_root,
+            extract_lookup_cache=extract_lookup_cache,
+            salesforce_lookup_cache=salesforce_lookup_cache,
+            current_load_record_ids=current_load_record_ids,
+            fallback_to_salesforce=fallback_to_salesforce,
+        )
+        if not target_opportunity_id or not target_contact_id:
+            missing_parts = []
+            if not target_opportunity_id:
+                missing_parts.append(f"Opportunity External_Id__c={source_opportunity_id}")
+            if not target_contact_id:
+                missing_parts.append(f"Contact External_Id__c={source_contact_id}")
+            append_result(
+                candidate=candidate,
+                operation="skip",
+                success=False,
+                payload={},
+                skipped_fields=candidate["skipped_fields"],
+                message=(
+                    "Cannot load OpportunityContactRole because related target record "
+                    f"was not found: {', '.join(missing_parts)}"
+                ),
+            )
+            return None
+
+        payload.pop("Opportunity", None)
+        payload.pop("Contact", None)
+        payload["OpportunityId"] = target_opportunity_id
+        payload["ContactId"] = target_contact_id
+        return target_opportunity_id, target_contact_id
+
+    def preload_existing_roles(candidates: List[Dict[str, Any]]) -> None:
+        opportunity_ids: Set[str] = set()
+        extra_fields: Set[str] = set()
+        for candidate in candidates:
+            natural_key = candidate.get("natural_key")
+            if natural_key:
+                opportunity_ids.add(natural_key[0])
+            for field_name in candidate.get("payload", {}):
+                if field_name in {"Id", "Opportunity", "Contact", "OpportunityId", "ContactId"}:
+                    continue
+                if field_name in field_defs:
+                    extra_fields.add(field_name)
+
+        preload_opportunity_contact_role_cache(
+            sf=sf,
+            opportunity_ids=opportunity_ids,
+            opportunity_contact_role_cache=opportunity_contact_role_cache,
+            extra_field_names=sorted(extra_fields),
+        )
+
+    def process_candidates(candidates: List[Dict[str, Any]]) -> None:
+        if not candidates:
+            return
+
+        for candidate in candidates:
+            if sample_limit_reached():
+                return
+            natural_key = resolve_candidate_parents(candidate)
+            if natural_key is None:
+                continue
+            candidate["natural_key"] = natural_key
+
+        actionable_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("natural_key") is not None
+            and (target_object, candidate["source_record_id"]) not in processed_load_keys
+        ]
+        if not actionable_candidates:
+            return
+
+        preload_existing_roles(actionable_candidates)
+
+        for candidate in actionable_candidates:
+            if sample_limit_reached():
+                return
+            if (target_object, candidate["source_record_id"]) in processed_load_keys:
+                continue
+
+            target_opportunity_id, target_contact_id = candidate["natural_key"]
+            existing_contact_role = get_cached_opportunity_contact_role(
+                opportunity_id=target_opportunity_id,
+                contact_id=target_contact_id,
+                opportunity_contact_role_cache=opportunity_contact_role_cache,
+            )
+            if existing_contact_role is None:
+                existing_contact_role = find_opportunity_contact_role(
+                    sf=sf,
+                    opportunity_id=target_opportunity_id,
+                    contact_id=target_contact_id,
+                    opportunity_contact_role_cache=opportunity_contact_role_cache,
+                )
+
+            target_record_id = (
+                normalize_blank(existing_contact_role.get("Id"))
+                if existing_contact_role
+                else normalize_blank(candidate.get("target_record_id"))
+            )
+            operation = "update" if target_record_id else "create"
+            payload = dict(candidate["payload"])
+            skipped_fields = list(candidate["skipped_fields"])
+
+            if operation == "create" and target_external_id_field and is_field_writable(target_external_id_field, "create"):
+                payload.setdefault("External_Id__c", candidate["source_record_id"])
+
+            apply_object_specific_payload_rules(
+                payload=payload,
+                target_object=target_object,
+                operation=operation,
+                target_record_id=target_record_id,
+                field_defs=field_defs,
+                skipped_fields=skipped_fields,
+            )
+
+            if operation == "update":
+                current_values_override = None
+                if existing_contact_role:
+                    comparable_fields = [
+                        field_name
+                        for field_name in payload
+                        if field_name in field_defs and field_name != "Id"
+                    ]
+                    if all(field_name in existing_contact_role for field_name in comparable_fields):
+                        current_values_override = existing_contact_role
+
+                filter_payload_to_actual_deltas(
+                    sf=sf,
+                    target_object=target_object,
+                    target_record_id=target_record_id,
+                    payload=payload,
+                    field_defs=field_defs,
+                    skipped_fields=skipped_fields,
+                    current_values_override=current_values_override,
+                )
+                if not payload:
+                    append_result(
+                        candidate=candidate,
+                        operation="skip",
+                        success=True,
+                        payload={},
+                        skipped_fields=skipped_fields,
+                        message="No actual OCR deltas after target lookup; no Salesforce write performed",
+                        target_record_id=target_record_id,
+                    )
+                    continue
+
+            if operation == "create" and candidate["natural_key"] in pending_create_pairs:
+                if bulk_buffer is not None:
+                    bulk_buffer.flush_target_object(target_object)
+                    pending_update_ids.clear()
+                    pending_create_pairs.clear()
+                existing_after_flush = get_cached_opportunity_contact_role(
+                    opportunity_id=target_opportunity_id,
+                    contact_id=target_contact_id,
+                    opportunity_contact_role_cache=opportunity_contact_role_cache,
+                )
+                if existing_after_flush:
+                    target_record_id = normalize_blank(existing_after_flush.get("Id"))
+                    operation = "update"
+                    payload = dict(candidate["payload"])
+                    skipped_fields = list(candidate["skipped_fields"])
+                    apply_object_specific_payload_rules(
+                        payload=payload,
+                        target_object=target_object,
+                        operation=operation,
+                        target_record_id=target_record_id,
+                        field_defs=field_defs,
+                        skipped_fields=skipped_fields,
+                    )
+                    filter_payload_to_actual_deltas(
+                        sf=sf,
+                        target_object=target_object,
+                        target_record_id=target_record_id,
+                        payload=payload,
+                        field_defs=field_defs,
+                        skipped_fields=skipped_fields,
+                        current_values_override=existing_after_flush,
+                    )
+                    if not payload:
+                        append_result(
+                            candidate=candidate,
+                            operation="skip",
+                            success=True,
+                            payload={},
+                            skipped_fields=skipped_fields,
+                            message=(
+                                "No actual OCR deltas after queued create completed; "
+                                "no Salesforce write performed"
+                            ),
+                            target_record_id=target_record_id,
+                        )
+                        continue
+                else:
+                    append_result(
+                        candidate=candidate,
+                        operation="skip",
+                        success=False,
+                        payload={},
+                        skipped_fields=skipped_fields,
+                        message=(
+                            "Duplicate OpportunityContactRole create avoided for same "
+                            "Opportunity/Contact pair; prior queued create did not return "
+                            "a reusable target id"
+                        ),
+                    )
+                    continue
+
+            if not payload:
+                append_result(
+                    candidate=candidate,
+                    operation="skip",
+                    success=False,
+                    payload={},
+                    skipped_fields=skipped_fields,
+                    message="No writable OCR payload after object-specific rules",
+                    target_record_id=target_record_id,
+                )
+                continue
+
+            queue_or_execute(
+                candidate=candidate,
+                operation=operation,
+                target_record_id=target_record_id,
+                payload=payload,
+                skipped_fields=skipped_fields,
+                natural_key=candidate["natural_key"],
+            )
+
+    for diff_row in iter_load_diff_rows_for_target_object(
+        checkpoint_root=checkpoint_root,
+        target_object=target_object,
+        source_objects_by_target=source_objects_by_target,
+        source_record_id_col=source_record_id_col,
+        target_record_id_col=target_record_id_col,
+        source_value_col=source_value_col,
+        source_load_value_col=source_load_value_col,
+        change_types=change_types,
+        batch_size=batch_size,
+    ):
+        if sample_limit_reached():
+            break
+
+        candidate = build_candidate(diff_row)
+        if candidate is None:
+            continue
+
+        candidate_batch.append(candidate)
+        if len(candidate_batch) >= candidate_batch_size:
+            process_candidates(candidate_batch)
+            candidate_batch = []
+
+    process_candidates(candidate_batch)
+    if bulk_buffer is not None:
+        bulk_buffer.flush_target_object(target_object)
+
+    return stats
 
 
 def find_diff_row_by_source_id(
@@ -3110,126 +3672,6 @@ def sync_opportunity_contact_role_from_opportunity_contact_id(
         skipped_fields=skipped_fields,
         dry_run=dry_run,
         single_record_reason="Opportunity.ContactId OCR routing with Bulk API unavailable in caller",
-    )
-
-
-def preload_opportunity_contact_role_natural_keys_for_batch(
-    sf,
-    target_object: str,
-    batch_rows: Dict[str, List[Any]],
-    row_count: int,
-    source_record_id_col: str,
-    target_record_id_col: str,
-    source_value_col: str,
-    source_load_value_col: str,
-    change_types: Set[str],
-    field_mappings: Dict[Tuple[str, str], List[Dict[str, Any]]],
-    field_defs: Dict[str, Dict[str, Any]],
-    relationship_field_defs: Dict[str, Dict[str, Any]],
-    target_external_id_field: Optional[Dict[str, Any]],
-    processed_load_keys: Set[Tuple[str, str]],
-    target_extract_root: Optional[Path],
-    extract_lookup_cache: Dict[str, Dict[str, str]],
-    salesforce_lookup_cache: Dict[Tuple[str, str], Optional[str]],
-    current_load_record_ids: Dict[Tuple[str, str], str],
-    describe_cache: Dict[str, Dict[str, Any]],
-    fallback_to_salesforce: bool,
-    opportunity_contact_role_cache: Optional[Dict[str, Any]],
-    extra_field_names: Optional[Iterable[str]] = None,
-) -> None:
-    if target_object != "OpportunityContactRole" or opportunity_contact_role_cache is None:
-        return
-
-    opportunity_ids: Set[str] = set()
-    for row_index in range(row_count):
-        change_type = normalize_blank(batch_rows["change_type"][row_index])
-        if change_type not in change_types:
-            continue
-
-        source_record_id = normalize_blank(batch_rows[source_record_id_col][row_index])
-        if not source_record_id or (target_object, source_record_id) in processed_load_keys:
-            continue
-
-        source_object = normalize_blank(batch_rows["Obj"][row_index])
-        source_payload = parse_json_dict(batch_rows[source_value_col][row_index])
-        source_load_payload = (
-            parse_json_dict(batch_rows[source_load_value_col][row_index])
-            if source_load_value_col in batch_rows
-            else {}
-        )
-        source_payload = merge_load_payload(
-            source_payload=source_payload,
-            source_load_payload=source_load_payload,
-        )
-        target_record_id = normalize_blank(batch_rows[target_record_id_col][row_index])
-        operation = resolve_operation(
-            target_record_id=target_record_id,
-            source_record_id=source_record_id,
-            target_external_id_field=target_external_id_field,
-        )
-        operation_hint = operation_hint_for_operation(
-            operation=operation,
-            target_record_id=target_record_id,
-        )
-        mapped_payload, _ = map_source_payload_to_target(
-            source_object=source_object,
-            source_payload=source_payload,
-            target_object=target_object,
-            field_mappings=field_mappings,
-            field_defs=field_defs,
-            relationship_field_defs=relationship_field_defs,
-            operation_hint=operation_hint,
-        )
-        if not mapped_payload:
-            continue
-
-        source_opportunity_id = get_reference_external_id_from_payload(
-            payload=mapped_payload,
-            relationship_field_defs=relationship_field_defs,
-            field_name="OpportunityId",
-            default_relationship_name="Opportunity",
-        )
-        source_contact_id = get_reference_external_id_from_payload(
-            payload=mapped_payload,
-            relationship_field_defs=relationship_field_defs,
-            field_name="ContactId",
-            default_relationship_name="Contact",
-        )
-        if not source_opportunity_id or not source_contact_id:
-            continue
-
-        target_opportunity_id = resolve_target_record_id_from_external_id(
-            object_name="Opportunity",
-            external_id_value=source_opportunity_id,
-            existing_target_record_id=None,
-            sf=sf,
-            describe_cache=describe_cache,
-            target_extract_root=target_extract_root,
-            extract_lookup_cache=extract_lookup_cache,
-            salesforce_lookup_cache=salesforce_lookup_cache,
-            current_load_record_ids=current_load_record_ids,
-            fallback_to_salesforce=fallback_to_salesforce,
-        )
-        target_contact_id = resolve_target_record_id_from_external_id(
-            object_name="Contact",
-            external_id_value=source_contact_id,
-            existing_target_record_id=None,
-            sf=sf,
-            describe_cache=describe_cache,
-            target_extract_root=target_extract_root,
-            extract_lookup_cache=extract_lookup_cache,
-            salesforce_lookup_cache=salesforce_lookup_cache,
-            current_load_record_ids=current_load_record_ids,
-            fallback_to_salesforce=fallback_to_salesforce,
-        )
-        if target_opportunity_id and target_contact_id:
-            opportunity_ids.add(target_opportunity_id)
-
-    preload_opportunity_contact_role_cache(
-        sf=sf,
-        opportunity_ids=opportunity_ids,
-        opportunity_contact_role_cache=opportunity_contact_role_cache,
-        extra_field_names=extra_field_names,
     )
 
 
