@@ -8,6 +8,7 @@ import ast
 import csv
 import json
 import re
+import sqlite3
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -1059,6 +1060,7 @@ def load_salesforce_diff_to_target(
 
     results_df = result_rows.to_dataframe()
     result_rows.write_error_outputs()
+    result_rows.close()
 
     print(
         f"\nLoad results written: {results_csv_path} "
@@ -5012,6 +5014,8 @@ class LoadResultRows:
             self.results_csv_path,
             "error_examples",
         )
+        self.state_db_path = derive_load_state_db_path(self.results_csv_path)
+        self.results_csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.keep_rows = keep_rows
         self.resume_from_existing = resume_from_existing
         self.example_limit_per_error = example_limit_per_error
@@ -5044,7 +5048,14 @@ class LoadResultRows:
             "Sample_Payload_JSON",
             "Sample_Message",
         ]
-        self.results_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_columns = self.columns + [
+            "Error_Category",
+            "Error_Code",
+            "Error_Fields",
+            "Error_Message",
+        ]
+        self.state_conn = sqlite3.connect(self.state_db_path)
+        self._initialize_state_db(reset=False)
         should_resume = (
             self.resume_from_existing
             and self.results_csv_path.exists()
@@ -5052,11 +5063,20 @@ class LoadResultRows:
         )
         if not should_resume:
             self._initialize_csv(self.results_csv_path, self.columns)
-        self._initialize_csv(self.failed_rows_csv_path, self.failed_columns)
-        self._initialize_csv(self.error_summary_csv_path, self.summary_columns)
-        self._initialize_csv(self.error_examples_csv_path, self.failed_columns)
-        if should_resume:
-            self._load_existing_results()
+            self._initialize_state_db(reset=True)
+            self._initialize_csv(self.failed_rows_csv_path, self.failed_columns)
+            self._initialize_csv(self.error_summary_csv_path, self.summary_columns)
+            self._initialize_csv(self.error_examples_csv_path, self.failed_columns)
+        else:
+            loaded_state = self._load_existing_state()
+            if loaded_state:
+                if not self.failed_rows_csv_path.exists():
+                    self._initialize_csv(self.failed_rows_csv_path, self.failed_columns)
+            else:
+                self._initialize_csv(self.failed_rows_csv_path, self.failed_columns)
+                self._initialize_csv(self.error_summary_csv_path, self.summary_columns)
+                self._initialize_csv(self.error_examples_csv_path, self.failed_columns)
+                self._load_existing_results()
 
     def append(self, row: Dict[str, Any]) -> None:
         clean_row = {column: row.get(column, "") for column in self.columns}
@@ -5081,6 +5101,7 @@ class LoadResultRows:
                 self.write_error_outputs()
 
         self._append_csv(self.results_csv_path, self.columns, clean_row)
+        self._append_state(clean_row)
         if self.keep_rows:
             self.rows.append(clean_row)
 
@@ -5112,8 +5133,149 @@ class LoadResultRows:
 
                 if self.keep_rows:
                     self.rows.append(clean_row)
+                self._append_state(clean_row)
 
         self.write_error_outputs()
+
+    def _load_existing_state(self) -> bool:
+        row_count = self.state_conn.execute(
+            "SELECT COUNT(*) FROM processed_records"
+        ).fetchone()[0]
+        if not row_count:
+            return False
+
+        for target_object, source_record_id in self.state_conn.execute(
+            'SELECT "Target_Object", "Source_RecordId" FROM processed_records'
+        ):
+            clean_target_object = normalize_blank(target_object)
+            clean_source_record_id = normalize_blank(source_record_id)
+            if clean_target_object and clean_source_record_id:
+                self.processed_load_keys.add((clean_target_object, clean_source_record_id))
+
+        success_count = self.state_conn.execute(
+            'SELECT COUNT(*) FROM processed_records WHERE UPPER("Success") = \'TRUE\''
+        ).fetchone()[0]
+        self.total_count = int(row_count)
+        self.success_count = int(success_count)
+        self.failure_count = int(row_count) - int(success_count)
+
+        if self.keep_rows:
+            select_columns = ", ".join(f'"{column}"' for column in self.columns)
+            for raw_row in self.state_conn.execute(
+                f"SELECT {select_columns} FROM processed_records ORDER BY id"
+            ):
+                self.rows.append(dict(zip(self.columns, raw_row)))
+
+        self._load_error_outputs_from_state()
+        self.write_error_outputs()
+        return True
+
+    def _load_error_outputs_from_state(self) -> None:
+        self.error_summary = {}
+        self.error_examples = {}
+
+        summary_query = """
+            WITH grouped AS (
+                SELECT
+                    "Target_Object",
+                    "Source_Object",
+                    "Operation",
+                    "Error_Category",
+                    "Error_Code",
+                    "Error_Fields",
+                    "Error_Message",
+                    COUNT(*) AS row_count,
+                    MIN(id) AS sample_id
+                FROM processed_records
+                WHERE UPPER("Success") != 'TRUE'
+                GROUP BY
+                    "Target_Object",
+                    "Source_Object",
+                    "Operation",
+                    "Error_Category",
+                    "Error_Code",
+                    "Error_Fields",
+                    "Error_Message"
+            )
+            SELECT
+                grouped."Target_Object",
+                grouped."Source_Object",
+                grouped."Operation",
+                grouped."Error_Category",
+                grouped."Error_Code",
+                grouped."Error_Fields",
+                grouped."Error_Message",
+                grouped.row_count,
+                sample."Source_RecordId",
+                sample."Target_RecordId",
+                sample."Payload_Field_Count",
+                sample."Payload_JSON",
+                sample."Message"
+            FROM grouped
+            JOIN processed_records sample ON sample.id = grouped.sample_id
+        """
+        for raw_row in self.state_conn.execute(summary_query):
+            (
+                target_object,
+                source_object,
+                operation,
+                error_category,
+                error_code,
+                error_fields,
+                error_message,
+                count,
+                sample_source_record_id,
+                sample_target_record_id,
+                sample_payload_field_count,
+                sample_payload_json,
+                sample_message,
+            ) = raw_row
+            key = (
+                target_object or "",
+                source_object or "",
+                operation or "",
+                error_category or "",
+                error_code or "",
+                error_fields or "",
+                error_message or "",
+            )
+            self.error_summary[key] = {
+                "Target_Object": target_object or "",
+                "Source_Object": source_object or "",
+                "Operation": operation or "",
+                "Error_Category": error_category or "",
+                "Error_Code": error_code or "",
+                "Error_Fields": error_fields or "",
+                "Error_Message": error_message or "",
+                "Count": int(count or 0),
+                "Sample_Source_RecordId": sample_source_record_id or "",
+                "Sample_Target_RecordId": sample_target_record_id or "",
+                "Sample_Payload_Field_Count": sample_payload_field_count or "",
+                "Sample_Payload_JSON": sample_payload_json or "",
+                "Sample_Message": sample_message or "",
+            }
+
+        select_columns = ", ".join(f'"{column}"' for column in self.failed_columns)
+        examples_query = (
+            f"SELECT {select_columns} "
+            "FROM processed_records "
+            "WHERE UPPER(\"Success\") != 'TRUE' "
+            "ORDER BY id"
+        )
+        for raw_row in self.state_conn.execute(examples_query):
+            failed_row = dict(zip(self.failed_columns, raw_row))
+            key = (
+                normalize_blank(failed_row.get("Target_Object")) or "",
+                normalize_blank(failed_row.get("Source_Object")) or "",
+                normalize_blank(failed_row.get("Operation")) or "",
+                normalize_blank(failed_row.get("Error_Category")) or "",
+                normalize_blank(failed_row.get("Error_Code")) or "",
+                normalize_blank(failed_row.get("Error_Fields")) or "",
+                normalize_blank(failed_row.get("Error_Message")) or "",
+            )
+            examples = self.error_examples.setdefault(key, [])
+            if len(examples) < self.example_limit_per_error:
+                examples.append(failed_row)
 
     def _track_processed_key(self, row: Dict[str, Any]) -> None:
         target_object = normalize_blank(row.get("Target_Object"))
@@ -5194,12 +5356,93 @@ class LoadResultRows:
             for row in rows:
                 writer.writerow({column: row.get(column, "") for column in columns})
 
+    def _initialize_state_db(self, reset: bool) -> None:
+        self.state_conn.execute("PRAGMA journal_mode=WAL")
+        self.state_conn.execute("PRAGMA synchronous=NORMAL")
+        if reset:
+            self.state_conn.execute("DROP TABLE IF EXISTS processed_records")
+        state_column_defs = ",\n                ".join(
+            f'"{column}" TEXT'
+            for column in self.state_columns
+        )
+        self.state_conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS processed_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {state_column_defs},
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE("Target_Object", "Source_RecordId")
+            )
+            """
+        )
+        self.state_conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_processed_records_target_object '
+            'ON processed_records ("Target_Object")'
+        )
+        self.state_conn.commit()
+
+    def _append_state(self, row: Dict[str, Any]) -> None:
+        target_object = normalize_blank(row.get("Target_Object"))
+        source_record_id = normalize_blank(row.get("Source_RecordId"))
+        if not target_object or not source_record_id:
+            return
+
+        state_row = {column: row.get(column, "") for column in self.columns}
+        if str(state_row.get("Success", "")).upper() == "TRUE":
+            state_row.update(
+                {
+                    "Error_Category": "",
+                    "Error_Code": "",
+                    "Error_Fields": "",
+                    "Error_Message": "",
+                }
+            )
+        else:
+            error_details = classify_load_result_error(state_row)
+            state_row.update(
+                {
+                    "Error_Category": error_details["category"],
+                    "Error_Code": error_details["code"],
+                    "Error_Fields": error_details["fields"],
+                    "Error_Message": error_details["message"],
+                }
+            )
+
+        quoted_columns = ", ".join(f'"{column}"' for column in self.state_columns)
+        placeholders = ", ".join("?" for _ in self.state_columns)
+        update_columns = ", ".join(
+            f'"{column}"=excluded."{column}"'
+            for column in self.state_columns
+        )
+        self.state_conn.execute(
+            f"""
+            INSERT INTO processed_records ({quoted_columns})
+            VALUES ({placeholders})
+            ON CONFLICT("Target_Object", "Source_RecordId") DO UPDATE SET
+                {update_columns},
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            [state_row.get(column, "") for column in self.state_columns],
+        )
+        self.state_conn.commit()
+
+    def close(self) -> None:
+        self.state_conn.commit()
+        self.state_conn.close()
+
 
 def derive_load_output_path(results_csv_path: Path, suffix: str) -> Path:
     stem = results_csv_path.stem
     if stem.endswith("_full"):
         stem = stem[:-5]
     return results_csv_path.with_name(f"{stem}_{suffix}.csv")
+
+
+def derive_load_state_db_path(results_csv_path: Path) -> Path:
+    stem = results_csv_path.stem
+    if stem.endswith("_full"):
+        stem = stem[:-5]
+    return results_csv_path.with_name(f"{stem}_state.sqlite")
 
 
 def classify_load_result_error(row: Dict[str, Any]) -> Dict[str, str]:
