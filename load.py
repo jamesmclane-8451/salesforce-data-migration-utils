@@ -353,12 +353,25 @@ def load_salesforce_diff_to_target(
         }
         target_external_id_field = field_defs.get("External_Id__c")
 
-        print("Status: scanning diff records")
+        print("Status: preparing local diff work queue")
         if field_coverage_sample:
             print(f"Field-coverage sample record(s): {len(selected_source_ids)}")
             if not selected_source_ids:
                 print(f"Finished {target_object}: no selected sample records")
                 continue
+
+        result_rows.ensure_work_queue_for_object(
+            target_object=target_object,
+            source_objects=source_objects,
+            checkpoint_root=checkpoint_root,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            change_types=change_types,
+            processed_load_keys=processed_load_keys,
+            batch_size=batch_size,
+        )
 
         if target_object == "OpportunityContactRole":
             ocr_stats = load_opportunity_contact_role_diffs(
@@ -415,7 +428,19 @@ def load_salesforce_diff_to_target(
             print(f"Finished {target_object}: " + "; ".join(object_summary_parts))
             continue
 
-        for part_path in iter_record_diff_part_paths(checkpoint_root, source_objects):
+        for work_part in result_rows.iter_pending_work_part_batches(
+            target_object=target_object,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            batch_size=batch_size,
+            selected_source_ids=(
+                selected_source_ids
+                if field_coverage_sample
+                else None
+            ),
+        ):
             if sample_size is not None and total_attempted >= sample_size:
                 break
             selected_pending = has_pending_source_ids(
@@ -433,20 +458,7 @@ def load_salesforce_diff_to_target(
             ):
                 break
 
-            parquet_file = pq.ParquetFile(part_path)
-            available_columns = set(parquet_file.schema_arrow.names)
-            missing_diff_columns = set(diff_columns) - available_columns
-            if missing_diff_columns:
-                raise ValueError(
-                    f"{part_path} is missing required load column(s): "
-                    f"{', '.join(sorted(missing_diff_columns))}"
-                )
-
-            batch_columns = list(diff_columns)
-            if source_load_value_col in available_columns:
-                batch_columns.append(source_load_value_col)
-
-            for batch in parquet_file.iter_batches(columns=batch_columns, batch_size=batch_size):
+            for batch in work_part:
                 if sample_size is not None and total_attempted >= sample_size:
                     break
                 selected_pending = has_pending_source_ids(
@@ -659,6 +671,11 @@ def load_salesforce_diff_to_target(
                                     message="No writable mapped fields",
                                 )
                             )
+                        else:
+                            result_rows.mark_work_complete(
+                                target_object=target_object,
+                                source_record_id=source_record_id,
+                            )
                         continue
 
                     payload_error = prepare_payload_for_operation(
@@ -806,6 +823,11 @@ def load_salesforce_diff_to_target(
                                     )
                                 )
                             processed_load_keys.add(load_key)
+                            if not record_noop_skips:
+                                result_rows.mark_work_complete(
+                                    target_object=target_object,
+                                    source_record_id=source_record_id,
+                                )
                             continue
 
                     natural_key_target_record_id = find_target_record_id_by_natural_key(
@@ -914,6 +936,11 @@ def load_salesforce_diff_to_target(
                                 )
                             )
                         processed_load_keys.add(load_key)
+                        if not record_noop_skips and not routed_opportunity_contact_source_id:
+                            result_rows.mark_work_complete(
+                                target_object=target_object,
+                                source_record_id=source_record_id,
+                            )
                         continue
 
                     if change_type.startswith("missing_from_") and operation == "update":
@@ -1040,6 +1067,9 @@ def load_salesforce_diff_to_target(
                     object_attempted_by_change_type[change_type] += 1
                     processed_load_keys.add(load_key)
 
+                if bulk_buffer is not None:
+                    bulk_buffer.flush_target_object(target_object)
+
         if bulk_buffer is not None:
             bulk_buffer.flush_target_object(target_object)
 
@@ -1111,8 +1141,10 @@ def print_load_sequence(load_objects: List[str]) -> None:
         preview += f" -> ... ({len(load_objects)} total objects)"
     print(f"Load sequence: {preview}")
     print(
-        "Resume behavior: records already present in the result CSV are skipped; "
-        "objects may still be scanned to find remaining unattempted records."
+        "Resume behavior: SQLite state is used when available. On the first run "
+        "after this change, the loader backfills state from the existing results "
+        "CSV and builds each object's local diff work queue once; later restarts "
+        "read only pending queued work."
     )
 
 
@@ -2165,16 +2197,17 @@ def load_opportunity_contact_role_diffs(
                 natural_key=candidate["natural_key"],
             )
 
-    for diff_row in iter_load_diff_rows_for_target_object(
-        checkpoint_root=checkpoint_root,
+        if bulk_buffer is not None:
+            bulk_buffer.flush_target_object(target_object)
+
+    for diff_row in result_rows.iter_pending_work_dicts(
         target_object=target_object,
-        source_objects_by_target=source_objects_by_target,
-        source_record_id_col=source_record_id_col,
-        target_record_id_col=target_record_id_col,
-        source_value_col=source_value_col,
-        source_load_value_col=source_load_value_col,
-        change_types=change_types,
         batch_size=batch_size,
+        selected_source_ids=(
+            selected_source_ids
+            if field_coverage_sample
+            else None
+        ),
     ):
         if sample_limit_reached():
             break
@@ -5054,6 +5087,16 @@ class LoadResultRows:
             "Error_Fields",
             "Error_Message",
         ]
+        self.work_queue_columns = [
+            "Target_Object",
+            "Source_Object",
+            "Source_RecordId",
+            "Target_RecordId",
+            "Change_Type",
+            "Source_Payload_JSON",
+            "Source_Load_Payload_JSON",
+            "Status",
+        ]
         self.state_conn = sqlite3.connect(self.state_db_path)
         self._initialize_state_db(reset=False)
         should_resume = (
@@ -5361,6 +5404,8 @@ class LoadResultRows:
         self.state_conn.execute("PRAGMA synchronous=NORMAL")
         if reset:
             self.state_conn.execute("DROP TABLE IF EXISTS processed_records")
+            self.state_conn.execute("DROP TABLE IF EXISTS load_work_queue")
+            self.state_conn.execute("DROP TABLE IF EXISTS load_work_queue_object_status")
         state_column_defs = ",\n                ".join(
             f'"{column}" TEXT'
             for column in self.state_columns
@@ -5378,6 +5423,38 @@ class LoadResultRows:
         self.state_conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_processed_records_target_object '
             'ON processed_records ("Target_Object")'
+        )
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS load_work_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Target_Object" TEXT NOT NULL,
+                "Source_Object" TEXT NOT NULL,
+                "Source_RecordId" TEXT NOT NULL,
+                "Target_RecordId" TEXT,
+                "Change_Type" TEXT NOT NULL,
+                "Source_Payload_JSON" TEXT NOT NULL,
+                "Source_Load_Payload_JSON" TEXT NOT NULL,
+                "Status" TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE("Target_Object", "Source_RecordId")
+            )
+            """
+        )
+        self.state_conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_load_work_queue_object_status '
+            'ON load_work_queue ("Target_Object", "Status", id)'
+        )
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS load_work_queue_object_status (
+                "Target_Object" TEXT PRIMARY KEY,
+                "Status" TEXT NOT NULL,
+                "Signature" TEXT NOT NULL,
+                "Row_Count" INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
         self.state_conn.commit()
 
@@ -5424,11 +5501,398 @@ class LoadResultRows:
             """,
             [state_row.get(column, "") for column in self.state_columns],
         )
+        self.state_conn.execute(
+            """
+            UPDATE load_work_queue
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            (target_object, source_record_id),
+        )
         self.state_conn.commit()
+
+    def mark_work_complete(self, target_object: str, source_record_id: str) -> None:
+        clean_target_object = normalize_blank(target_object)
+        clean_source_record_id = normalize_blank(source_record_id)
+        if not clean_target_object or not clean_source_record_id:
+            return
+
+        self.state_conn.execute(
+            """
+            UPDATE load_work_queue
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            (clean_target_object, clean_source_record_id),
+        )
+        self.state_conn.commit()
+
+    def ensure_work_queue_for_object(
+        self,
+        target_object: str,
+        source_objects: List[str],
+        checkpoint_root: Path,
+        source_record_id_col: str,
+        target_record_id_col: str,
+        source_value_col: str,
+        source_load_value_col: str,
+        change_types: Set[str],
+        processed_load_keys: Set[Tuple[str, str]],
+        batch_size: int,
+    ) -> None:
+        signature = json.dumps(
+            {
+                "checkpoint_root": str(checkpoint_root.resolve()),
+                "source_objects": sorted(source_objects),
+                "source_record_id_col": source_record_id_col,
+                "target_record_id_col": target_record_id_col,
+                "source_value_col": source_value_col,
+                "source_load_value_col": source_load_value_col,
+                "change_types": sorted(change_types),
+            },
+            sort_keys=True,
+        )
+        status_row = self.state_conn.execute(
+            """
+            SELECT "Status", "Signature", "Row_Count"
+            FROM load_work_queue_object_status
+            WHERE "Target_Object" = ?
+            """,
+            (target_object,),
+        ).fetchone()
+        if (
+            status_row
+            and status_row[0] == "complete"
+            and status_row[1] == signature
+        ):
+            pending_count = self.pending_work_count(target_object)
+            print(
+                f"Status: local work queue ready for {target_object}: "
+                f"{pending_count} pending row(s)"
+            )
+            return
+
+        print(f"Status: building local work queue for {target_object}")
+        self.state_conn.execute(
+            'DELETE FROM load_work_queue WHERE "Target_Object" = ?',
+            (target_object,),
+        )
+        self.state_conn.execute(
+            """
+            INSERT INTO load_work_queue_object_status
+                ("Target_Object", "Status", "Signature", "Row_Count", updated_at)
+            VALUES (?, 'building', ?, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT("Target_Object") DO UPDATE SET
+                "Status" = 'building',
+                "Signature" = excluded."Signature",
+                "Row_Count" = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (target_object, signature),
+        )
+        self.state_conn.commit()
+
+        queue_rows: List[Tuple[str, str, str, str, str, str, str, str]] = []
+        row_count = 0
+        required_columns = {
+            "Obj",
+            source_record_id_col,
+            target_record_id_col,
+            source_value_col,
+            "change_type",
+        }
+
+        for part_path in iter_record_diff_part_paths(checkpoint_root, source_objects):
+            parquet_file = pq.ParquetFile(part_path)
+            available_columns = set(parquet_file.schema_arrow.names)
+            if not required_columns.issubset(available_columns):
+                continue
+
+            batch_columns = [
+                "Obj",
+                source_record_id_col,
+                target_record_id_col,
+                source_value_col,
+                "change_type",
+            ]
+            has_source_load_value = source_load_value_col in available_columns
+            if has_source_load_value:
+                batch_columns.append(source_load_value_col)
+
+            for batch in parquet_file.iter_batches(
+                columns=batch_columns,
+                batch_size=batch_size,
+            ):
+                batch_rows = batch.to_pydict()
+                for row_index in range(len(batch_rows["Obj"])):
+                    change_type = normalize_blank(batch_rows["change_type"][row_index])
+                    if change_type not in change_types:
+                        continue
+
+                    source_record_id = normalize_blank(
+                        batch_rows[source_record_id_col][row_index]
+                    )
+                    if not source_record_id:
+                        continue
+
+                    source_object = normalize_blank(batch_rows["Obj"][row_index])
+                    if not source_object:
+                        continue
+
+                    target_record_id = normalize_blank(
+                        batch_rows[target_record_id_col][row_index]
+                    )
+                    source_payload_json = queue_json_text(
+                        batch_rows[source_value_col][row_index]
+                    )
+                    source_load_payload_json = (
+                        queue_json_text(batch_rows[source_load_value_col][row_index])
+                        if has_source_load_value
+                        else "{}"
+                    )
+                    status = (
+                        "complete"
+                        if (target_object, source_record_id) in processed_load_keys
+                        else "pending"
+                    )
+                    queue_rows.append(
+                        (
+                            target_object,
+                            source_object,
+                            source_record_id,
+                            target_record_id or "",
+                            change_type,
+                            source_payload_json,
+                            source_load_payload_json,
+                            status,
+                        )
+                    )
+                    row_count += 1
+
+                    if len(queue_rows) >= 50000:
+                        self._insert_work_queue_rows(queue_rows)
+                        queue_rows = []
+                        print(
+                            f"Status: queued {row_count} diff row(s) for {target_object}"
+                        )
+
+        if queue_rows:
+            self._insert_work_queue_rows(queue_rows)
+
+        self.state_conn.execute(
+            """
+            UPDATE load_work_queue_object_status
+            SET "Status" = 'complete',
+                "Row_Count" = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            """,
+            (row_count, target_object),
+        )
+        self.state_conn.commit()
+        print(
+            f"Status: local work queue built for {target_object}: "
+            f"{row_count} total row(s), {self.pending_work_count(target_object)} pending"
+        )
+
+    def _insert_work_queue_rows(
+        self,
+        rows: List[Tuple[str, str, str, str, str, str, str, str]],
+    ) -> None:
+        self.state_conn.executemany(
+            """
+            INSERT OR IGNORE INTO load_work_queue (
+                "Target_Object",
+                "Source_Object",
+                "Source_RecordId",
+                "Target_RecordId",
+                "Change_Type",
+                "Source_Payload_JSON",
+                "Source_Load_Payload_JSON",
+                "Status"
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.state_conn.commit()
+
+    def pending_work_count(self, target_object: str) -> int:
+        return int(
+            self.state_conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM load_work_queue
+                WHERE "Target_Object" = ?
+                AND "Status" = 'pending'
+                """,
+                (target_object,),
+            ).fetchone()[0]
+        )
+
+    def iter_pending_work_batches(
+        self,
+        target_object: str,
+        source_record_id_col: str,
+        target_record_id_col: str,
+        source_value_col: str,
+        source_load_value_col: str,
+        batch_size: int,
+        selected_source_ids: Optional[Set[str]] = None,
+    ) -> Iterable[Dict[str, List[Any]]]:
+        selected_filter_sql = ""
+        params: List[Any] = [target_object]
+        if selected_source_ids is not None:
+            selected_ids = sorted(
+                source_id
+                for source_id in selected_source_ids
+                if normalize_blank(source_id)
+            )
+            if not selected_ids:
+                return
+            self._prepare_selected_work_ids(selected_ids)
+            selected_filter_sql = (
+                'AND "Source_RecordId" IN ('
+                'SELECT "Source_RecordId" FROM selected_work_source_ids'
+                ')'
+            )
+
+        while True:
+            rows = self.state_conn.execute(
+                f"""
+                SELECT
+                    "Source_Object",
+                    "Source_RecordId",
+                    "Target_RecordId",
+                    "Change_Type",
+                    "Source_Payload_JSON",
+                    "Source_Load_Payload_JSON"
+                FROM load_work_queue
+                WHERE "Target_Object" = ?
+                AND "Status" = 'pending'
+                {selected_filter_sql}
+                ORDER BY id
+                LIMIT ?
+                """,
+                [*params, batch_size],
+            ).fetchall()
+            if not rows:
+                return
+
+            yield {
+                "Obj": [row[0] for row in rows],
+                source_record_id_col: [row[1] for row in rows],
+                target_record_id_col: [row[2] for row in rows],
+                "change_type": [row[3] for row in rows],
+                source_value_col: [row[4] for row in rows],
+                source_load_value_col: [row[5] for row in rows],
+            }
+
+    def iter_pending_work_part_batches(
+        self,
+        target_object: str,
+        source_record_id_col: str,
+        target_record_id_col: str,
+        source_value_col: str,
+        source_load_value_col: str,
+        batch_size: int,
+        selected_source_ids: Optional[Set[str]] = None,
+    ) -> Iterable[List[LoadWorkBatch]]:
+        for batch_rows in self.iter_pending_work_batches(
+            target_object=target_object,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            batch_size=batch_size,
+            selected_source_ids=selected_source_ids,
+        ):
+            yield [LoadWorkBatch(batch_rows)]
+
+    def iter_pending_work_dicts(
+        self,
+        target_object: str,
+        batch_size: int,
+        selected_source_ids: Optional[Set[str]] = None,
+    ) -> Iterable[Dict[str, Any]]:
+        selected_filter_sql = ""
+        params: List[Any] = [target_object]
+        if selected_source_ids is not None:
+            selected_ids = sorted(
+                source_id
+                for source_id in selected_source_ids
+                if normalize_blank(source_id)
+            )
+            if not selected_ids:
+                return
+            self._prepare_selected_work_ids(selected_ids)
+            selected_filter_sql = (
+                'AND "Source_RecordId" IN ('
+                'SELECT "Source_RecordId" FROM selected_work_source_ids'
+                ')'
+            )
+
+        while True:
+            rows = self.state_conn.execute(
+                f"""
+                SELECT
+                    "Source_Object",
+                    "Source_RecordId",
+                    "Target_RecordId",
+                    "Change_Type",
+                    "Source_Payload_JSON",
+                    "Source_Load_Payload_JSON"
+                FROM load_work_queue
+                WHERE "Target_Object" = ?
+                AND "Status" = 'pending'
+                {selected_filter_sql}
+                ORDER BY id
+                LIMIT ?
+                """,
+                [*params, batch_size],
+            ).fetchall()
+            if not rows:
+                return
+
+            for row in rows:
+                yield {
+                    "source_object": normalize_blank(row[0]),
+                    "source_record_id": normalize_blank(row[1]),
+                    "target_record_id": normalize_blank(row[2]),
+                    "change_type": normalize_blank(row[3]),
+                    "source_payload": parse_json_dict(row[4]),
+                    "source_load_payload": parse_json_dict(row[5]),
+                }
+
+    def _prepare_selected_work_ids(self, selected_source_ids: List[str]) -> None:
+        self.state_conn.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS selected_work_source_ids (
+                "Source_RecordId" TEXT PRIMARY KEY
+            )
+            """
+        )
+        self.state_conn.execute("DELETE FROM selected_work_source_ids")
+        self.state_conn.executemany(
+            'INSERT OR IGNORE INTO selected_work_source_ids ("Source_RecordId") VALUES (?)',
+            [(source_id,) for source_id in selected_source_ids],
+        )
 
     def close(self) -> None:
         self.state_conn.commit()
         self.state_conn.close()
+
+
+class LoadWorkBatch:
+    def __init__(self, rows: Dict[str, List[Any]]) -> None:
+        self.rows = rows
+
+    def to_pydict(self) -> Dict[str, List[Any]]:
+        return self.rows
 
 
 def derive_load_output_path(results_csv_path: Path, suffix: str) -> Path:
@@ -5443,6 +5907,13 @@ def derive_load_state_db_path(results_csv_path: Path) -> Path:
     if stem.endswith("_full"):
         stem = stem[:-5]
     return results_csv_path.with_name(f"{stem}_state.sqlite")
+
+
+def queue_json_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    text = normalize_blank(value)
+    return text if text is not None else "{}"
 
 
 def classify_load_result_error(row: Dict[str, Any]) -> Dict[str, str]:
