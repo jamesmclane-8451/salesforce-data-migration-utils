@@ -1134,6 +1134,616 @@ def resolve_load_step_config(
     return config
 
 
+def prepare_salesforce_load_work(
+    target_env: str,
+    source_env: str,
+    diff_checkpoint_dir: str,
+    metadata_scope_csv_path: str,
+    upsert_sequence_csv_path: str,
+    object_source_policy_csv_path: Optional[str] = "migration_object_source_policy.csv",
+    results_csv_path: str = "load_results.csv",
+    object_filter: Optional[List[str]] = None,
+    change_type_filter: Optional[List[str]] = None,
+    resume_from_results: bool = True,
+    rebuild_prepared_work: bool = False,
+    batch_size: int = 50000,
+) -> pd.DataFrame:
+    """
+    Build the local Salesforce load plan from diff output.
+
+    This step does the expensive non-load work once: scan diff parquet, apply
+    metadata mappings, determine the initial write operation, and persist
+    target-field payloads in SQLite. It does not write to Salesforce.
+    """
+
+    checkpoint_root = Path(diff_checkpoint_dir)
+    metadata_path = Path(metadata_scope_csv_path)
+    sequence_path = Path(upsert_sequence_csv_path)
+    object_source_policy_path = (
+        Path(object_source_policy_csv_path)
+        if object_source_policy_csv_path
+        else None
+    )
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Diff checkpoint directory not found: {checkpoint_root}")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata scope CSV not found: {metadata_path}")
+    if not sequence_path.exists():
+        raise FileNotFoundError(f"Upsert sequence CSV not found: {sequence_path}")
+
+    change_types = set(change_type_filter or ["data_gap", f"missing_from_{target_env.lower()}"])
+    object_filter_set = set(object_filter or [])
+    source_record_id_col = f"{source_env.lower()}_recordid"
+    target_record_id_col = f"{target_env.lower()}_recordid"
+    source_value_col = f"{source_env}_value"
+    source_load_value_col = f"{source_env}_load_value"
+
+    field_mappings, source_objects_by_target = build_prod_to_target_field_mappings(metadata_path)
+    load_objects = read_upsert_sequence(sequence_path, object_filter_set)
+    load_objects = apply_object_source_policy(
+        load_objects=load_objects,
+        source_env=source_env,
+        policy_path=object_source_policy_path,
+    )
+
+    result_rows = LoadResultRows(
+        results_csv_path=results_csv_path,
+        keep_rows=False,
+        resume_from_existing=resume_from_results,
+    )
+    work_store = PreparedLoadWorkStore(results_csv_path)
+    work_store.reconcile_completed_work()
+
+    print(f"Connecting to Salesforce env [{target_env}] for prepare metadata")
+    sf = get_salesforce_connection(env=target_env)
+    describe_cache: Dict[str, Dict[str, Any]] = {}
+    prepared_summaries: List[Dict[str, Any]] = []
+
+    print("\nPreparing Salesforce load work")
+    print_load_sequence(load_objects)
+
+    for object_index, target_object in enumerate(load_objects, start=1):
+        source_objects = sorted(source_objects_by_target.get(target_object, {target_object}))
+        signature = build_prepared_work_signature(
+            target_env=target_env,
+            source_env=source_env,
+            target_object=target_object,
+            source_objects=source_objects,
+            checkpoint_root=checkpoint_root,
+            metadata_path=metadata_path,
+            sequence_path=sequence_path,
+            object_source_policy_path=object_source_policy_path,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            change_types=change_types,
+        )
+        if not rebuild_prepared_work and work_store.object_is_ready(target_object, signature):
+            work_store.reconcile_completed_work(target_object)
+            prepared_count = work_store.prepared_count(target_object)
+            pending_count = work_store.pending_count(target_object)
+            print(
+                f"\n=== Prepare {object_index}/{len(load_objects)}: {target_object} ==="
+            )
+            print(
+                "Status: prepared work already current; "
+                f"{prepared_count} prepared row(s), {pending_count} pending"
+            )
+            prepared_summaries.append(
+                {
+                    "Target_Object": target_object,
+                    "Prepared_Rows": prepared_count,
+                    "Pending_Rows": pending_count,
+                    "Status": "already_current",
+                }
+            )
+            continue
+
+        print(f"\n=== Prepare {object_index}/{len(load_objects)}: {target_object} ===")
+        print(f"Source diff object(s): {', '.join(source_objects)}")
+        print("Status: preparing target metadata")
+        describe = get_object_describe(sf, target_object, describe_cache)
+        field_defs = {
+            field_def["name"]: field_def
+            for field_def in describe.get("fields", [])
+            if field_def.get("name")
+        }
+        relationship_field_defs = {
+            str(field_def.get("relationshipName")).strip(): field_def
+            for field_def in field_defs.values()
+            if field_def.get("relationshipName")
+        }
+        target_external_id_field = field_defs.get("External_Id__c")
+
+        result_rows.ensure_work_queue_for_object(
+            target_object=target_object,
+            source_objects=source_objects,
+            checkpoint_root=checkpoint_root,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            change_types=change_types,
+            processed_load_keys=result_rows.processed_load_keys,
+            batch_size=batch_size,
+        )
+        work_store.begin_object(target_object, signature)
+
+        prepared_count = 0
+        skipped_count = 0
+        for batch_rows in result_rows.iter_pending_work_batches_once(
+            target_object=target_object,
+            source_record_id_col=source_record_id_col,
+            target_record_id_col=target_record_id_col,
+            source_value_col=source_value_col,
+            source_load_value_col=source_load_value_col,
+            batch_size=batch_size,
+        ):
+            prepared_rows: List[Dict[str, Any]] = []
+            row_count = len(batch_rows["Obj"])
+            for row_index in range(row_count):
+                source_object = normalize_blank(batch_rows["Obj"][row_index])
+                source_record_id = normalize_blank(batch_rows[source_record_id_col][row_index])
+                target_record_id = normalize_blank(batch_rows[target_record_id_col][row_index])
+                change_type = normalize_blank(batch_rows["change_type"][row_index]) or ""
+                if not source_object or not source_record_id:
+                    skipped_count += 1
+                    continue
+                if (target_object, source_record_id) in result_rows.processed_load_keys:
+                    skipped_count += 1
+                    result_rows.mark_work_complete(target_object, source_record_id)
+                    continue
+
+                source_payload = parse_json_dict(batch_rows[source_value_col][row_index])
+                source_load_payload = parse_json_dict(batch_rows[source_load_value_col][row_index])
+                source_payload = merge_load_payload(
+                    source_payload=source_payload,
+                    source_load_payload=source_load_payload,
+                )
+                operation = resolve_operation(
+                    target_record_id=target_record_id,
+                    source_record_id=source_record_id,
+                    target_external_id_field=target_external_id_field,
+                )
+                operation_hint = operation_hint_for_operation(
+                    operation=operation,
+                    target_record_id=target_record_id,
+                )
+                mapped_payload, skipped_fields = map_source_payload_to_target(
+                    source_object=source_object,
+                    source_payload=source_payload,
+                    target_object=target_object,
+                    field_mappings=field_mappings,
+                    field_defs=field_defs,
+                    relationship_field_defs=relationship_field_defs,
+                    operation_hint=operation_hint,
+                )
+                if not mapped_payload:
+                    skipped_count += 1
+                    result_rows.mark_work_complete(target_object, source_record_id)
+                    continue
+
+                prepared_rows.append(
+                    {
+                        "Target_Object": target_object,
+                        "Source_Object": source_object,
+                        "Source_RecordId": source_record_id,
+                        "Target_RecordId": target_record_id or "",
+                        "Change_Type": change_type,
+                        "Operation": operation,
+                        "Payload_JSON": json.dumps(
+                            mapped_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        "Skipped_Fields_JSON": json.dumps(
+                            skipped_fields,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        "Status": "pending",
+                    }
+                )
+                prepared_count += 1
+
+            if prepared_rows:
+                work_store.insert_rows(prepared_rows)
+                print(
+                    f"Status: prepared {prepared_count} row(s) for {target_object}"
+                )
+
+        work_store.finish_object(target_object, prepared_count)
+        pending_count = work_store.pending_count(target_object)
+        print(
+            f"Finished preparing {target_object}: "
+            f"prepared={prepared_count}; skipped_no_work={skipped_count}; "
+            f"pending={pending_count}"
+        )
+        prepared_summaries.append(
+            {
+                "Target_Object": target_object,
+                "Prepared_Rows": prepared_count,
+                "Pending_Rows": pending_count,
+                "Status": "rebuilt" if rebuild_prepared_work else "prepared",
+            }
+        )
+
+    result_rows.close()
+    work_store.close()
+    summary_df = pd.DataFrame(prepared_summaries)
+    summary_path = Path(results_csv_path).with_name("prepared_load_work_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print(f"\nPrepared load work summary written: {summary_path}")
+    return summary_df
+
+
+def load_prepared_salesforce_work(
+    target_env: str,
+    source_env: str,
+    metadata_scope_csv_path: str,
+    upsert_sequence_csv_path: str,
+    object_source_policy_csv_path: Optional[str] = "migration_object_source_policy.csv",
+    target_extract_dir: Optional[str] = None,
+    results_csv_path: str = "load_results.csv",
+    object_filter: Optional[List[str]] = None,
+    dry_run: bool = False,
+    resume_from_results: bool = True,
+    resolve_relationships: bool = True,
+    relationship_resolution_fallback_to_salesforce: bool = True,
+    use_bulk_api: bool = True,
+    bulk_batch_size: int = 500,
+    bulk_use_serial: bool = False,
+    batch_size: int = 50000,
+) -> pd.DataFrame:
+    """
+    Execute already-prepared Salesforce load work.
+
+    This function intentionally does not scan diff parquet or perform source
+    field mapping. It reads pending prepared payloads from SQLite, resolves
+    target relationship IDs as late as possible, submits Bulk API batches, and
+    records results.
+    """
+
+    metadata_path = Path(metadata_scope_csv_path)
+    sequence_path = Path(upsert_sequence_csv_path)
+    object_source_policy_path = (
+        Path(object_source_policy_csv_path)
+        if object_source_policy_csv_path
+        else None
+    )
+    target_extract_root = Path(target_extract_dir) if target_extract_dir else None
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata scope CSV not found: {metadata_path}")
+    if not sequence_path.exists():
+        raise FileNotFoundError(f"Upsert sequence CSV not found: {sequence_path}")
+    if target_extract_root is not None and not target_extract_root.exists():
+        raise FileNotFoundError(f"Target extract directory not found: {target_extract_root}")
+
+    object_filter_set = set(object_filter or [])
+    load_objects = read_upsert_sequence(sequence_path, object_filter_set)
+    load_objects = apply_object_source_policy(
+        load_objects=load_objects,
+        source_env=source_env,
+        policy_path=object_source_policy_path,
+    )
+
+    print(f"Connecting to Salesforce env [{target_env}] for prepared load")
+    sf = get_salesforce_connection(env=target_env)
+    describe_cache: Dict[str, Dict[str, Any]] = {}
+    external_id_lookup_cache: Dict[Tuple[str, str], Optional[str]] = {}
+    extract_external_id_lookup_cache: Dict[str, Dict[str, str]] = {}
+    current_load_record_ids: Dict[Tuple[str, str], str] = {}
+    opportunity_contact_role_cache: Dict[str, Any] = {
+        "loaded_opportunity_ids": set(),
+        "roles_by_pair": {},
+        "roles_by_id": {},
+    }
+
+    result_rows = LoadResultRows(
+        results_csv_path=results_csv_path,
+        keep_rows=False,
+        resume_from_existing=resume_from_results,
+    )
+    seed_current_load_record_ids_from_result_state(
+        result_rows=result_rows,
+        current_load_record_ids=current_load_record_ids,
+    )
+    work_store = PreparedLoadWorkStore(results_csv_path)
+    work_store.reconcile_completed_work()
+
+    bulk_buffer = (
+        BulkOperationBuffer(
+            sf=sf,
+            target_env=target_env,
+            source_env=source_env,
+            result_rows=result_rows,
+            current_load_record_ids=current_load_record_ids,
+            bulk_batch_size=bulk_batch_size,
+            bulk_use_serial=bulk_use_serial,
+        )
+        if use_bulk_api and not dry_run
+        else None
+    )
+
+    print(
+        f"\nStarting prepared load into {target_env} from {source_env} values"
+    )
+    if bulk_buffer is not None:
+        print(
+            f"Bulk API mode enabled: batch_size={bulk_batch_size}, "
+            f"use_serial={bulk_use_serial}"
+        )
+    print_load_sequence(load_objects)
+
+    total_attempted = 0
+    for object_index, target_object in enumerate(load_objects, start=1):
+        pending_before = work_store.pending_count(target_object)
+        print(
+            f"\n=== Prepared Object {object_index}/{len(load_objects)}: "
+            f"{target_env}.{target_object} ==="
+        )
+        print(f"Pending prepared row(s): {pending_before}")
+        if pending_before == 0:
+            continue
+
+        print("Status: preparing target metadata")
+        describe = get_object_describe(sf, target_object, describe_cache)
+        field_defs = {
+            field_def["name"]: field_def
+            for field_def in describe.get("fields", [])
+            if field_def.get("name")
+        }
+        relationship_field_defs = {
+            str(field_def.get("relationshipName")).strip(): field_def
+            for field_def in field_defs.values()
+            if field_def.get("relationshipName")
+        }
+        target_external_id_field = field_defs.get("External_Id__c")
+        object_attempted = 0
+        object_skipped = 0
+
+        for prepared_batch in work_store.iter_pending_batches(
+            target_object=target_object,
+            batch_size=batch_size,
+        ):
+            if target_object == "OpportunityContactRole":
+                preload_prepared_ocr_batch(
+                    prepared_batch=prepared_batch,
+                    relationship_field_defs=relationship_field_defs,
+                    sf=sf,
+                    describe_cache=describe_cache,
+                    target_extract_root=target_extract_root,
+                    extract_lookup_cache=extract_external_id_lookup_cache,
+                    salesforce_lookup_cache=external_id_lookup_cache,
+                    current_load_record_ids=current_load_record_ids,
+                    fallback_to_salesforce=relationship_resolution_fallback_to_salesforce,
+                    opportunity_contact_role_cache=opportunity_contact_role_cache,
+                )
+
+            for prepared_row in prepared_batch:
+                source_object = normalize_blank(prepared_row.get("Source_Object")) or ""
+                source_record_id = normalize_blank(prepared_row.get("Source_RecordId"))
+                target_record_id = normalize_blank(prepared_row.get("Target_RecordId"))
+                change_type = normalize_blank(prepared_row.get("Change_Type")) or ""
+                operation = normalize_blank(prepared_row.get("Operation")) or "update"
+                payload = dict(prepared_row.get("Payload") or {})
+                skipped_fields = list(prepared_row.get("Skipped_Fields") or [])
+                if not source_record_id:
+                    object_skipped += 1
+                    continue
+                load_key = (target_object, source_record_id)
+                if load_key in result_rows.processed_load_keys:
+                    object_skipped += 1
+                    work_store.mark_complete(target_object, source_record_id)
+                    continue
+
+                routed_opportunity_contact_source_id = get_routed_opportunity_contact_source_id(
+                    target_object=target_object,
+                    payload=payload,
+                )
+
+                if resolve_relationships:
+                    resolve_relationship_payload_to_ids(
+                        payload=payload,
+                        relationship_field_defs=relationship_field_defs,
+                        sf=sf,
+                        describe_cache=describe_cache,
+                        target_extract_root=target_extract_root,
+                        extract_lookup_cache=extract_external_id_lookup_cache,
+                        salesforce_lookup_cache=external_id_lookup_cache,
+                        current_load_record_ids=current_load_record_ids,
+                        skipped_fields=skipped_fields,
+                        fallback_to_salesforce=relationship_resolution_fallback_to_salesforce,
+                    )
+
+                natural_key_target_record_id = find_target_record_id_by_natural_key(
+                    sf=sf,
+                    target_object=target_object,
+                    payload=payload,
+                    opportunity_contact_role_cache=opportunity_contact_role_cache,
+                )
+                if natural_key_target_record_id:
+                    target_record_id = natural_key_target_record_id
+                    operation = "update"
+                    add_external_id_for_natural_key_update(
+                        payload=payload,
+                        source_record_id=source_record_id,
+                        target_external_id_field=target_external_id_field,
+                        skipped_fields=skipped_fields,
+                    )
+
+                apply_object_specific_payload_rules(
+                    payload=payload,
+                    target_object=target_object,
+                    operation=operation,
+                    target_record_id=target_record_id,
+                    field_defs=field_defs,
+                    skipped_fields=skipped_fields,
+                )
+                apply_source_target_payload_rules(
+                    payload=payload,
+                    source_object=source_object,
+                    target_object=target_object,
+                    operation=operation,
+                    target_record_id=target_record_id,
+                    field_defs=field_defs,
+                    skipped_fields=skipped_fields,
+                    sf=sf,
+                    describe_cache=describe_cache,
+                )
+
+                if not payload:
+                    result_rows.append(
+                        build_result_row(
+                            target_env=target_env,
+                            source_env=source_env,
+                            target_object=target_object,
+                            source_object=source_object,
+                            source_record_id=source_record_id,
+                            target_record_id=target_record_id,
+                            change_type=change_type,
+                            operation="skip",
+                            dry_run=dry_run,
+                            success=True,
+                            payload={},
+                            skipped_fields=skipped_fields,
+                            message="No writable prepared payload after relationship resolution/rules",
+                        )
+                    )
+                    object_skipped += 1
+                    continue
+
+                payload_error = prepare_payload_for_operation(
+                    payload=payload,
+                    operation=operation,
+                    source_record_id=source_record_id,
+                    target_external_id_field=target_external_id_field,
+                    operation_hint=operation_hint_for_operation(operation, target_record_id),
+                )
+                if payload_error:
+                    result_rows.append(
+                        build_result_row(
+                            target_env=target_env,
+                            source_env=source_env,
+                            target_object=target_object,
+                            source_object=source_object,
+                            source_record_id=source_record_id,
+                            target_record_id=target_record_id,
+                            change_type=change_type,
+                            operation=operation,
+                            dry_run=dry_run,
+                            success=False,
+                            payload=payload,
+                            skipped_fields=skipped_fields,
+                            message=payload_error,
+                        )
+                    )
+                    object_attempted += 1
+                    total_attempted += 1
+                    continue
+
+                if change_type.startswith("missing_from_") and operation == "update":
+                    current_values_override = None
+                    if target_object == "OpportunityContactRole":
+                        current_values_override = get_cached_opportunity_contact_role_by_id(
+                            target_record_id=target_record_id,
+                            opportunity_contact_role_cache=opportunity_contact_role_cache,
+                        )
+                    filter_payload_to_actual_deltas(
+                        sf=sf,
+                        target_object=target_object,
+                        target_record_id=target_record_id,
+                        payload=payload,
+                        field_defs=field_defs,
+                        skipped_fields=skipped_fields,
+                        current_values_override=current_values_override,
+                    )
+                    if not payload:
+                        result_rows.append(
+                            build_result_row(
+                                target_env=target_env,
+                                source_env=source_env,
+                                target_object=target_object,
+                                source_object=source_object,
+                                source_record_id=source_record_id,
+                                target_record_id=target_record_id,
+                                change_type=change_type,
+                                operation="skip",
+                                dry_run=dry_run,
+                                success=True,
+                                payload={},
+                                skipped_fields=skipped_fields,
+                                message="No actual deltas after target lookup; no Salesforce write performed",
+                            )
+                        )
+                        object_skipped += 1
+                        continue
+
+                if bulk_buffer is not None:
+                    bulk_buffer.add(
+                        target_object=target_object,
+                        source_object=source_object,
+                        source_record_id=source_record_id,
+                        target_record_id=target_record_id,
+                        change_type=change_type,
+                        operation=operation,
+                        payload=payload,
+                        skipped_fields=skipped_fields,
+                    )
+                else:
+                    result_row = execute_or_preview_operation(
+                        sf=sf,
+                        target_env=target_env,
+                        source_env=source_env,
+                        target_object=target_object,
+                        source_object=source_object,
+                        source_record_id=source_record_id,
+                        target_record_id=target_record_id,
+                        change_type=change_type,
+                        operation=operation,
+                        payload=payload,
+                        skipped_fields=skipped_fields,
+                        dry_run=dry_run,
+                        single_record_reason="Bulk API disabled for prepared loader run",
+                    )
+                    result_rows.append(result_row)
+                    remember_loaded_record_id(
+                        result_row=result_row,
+                        target_object=target_object,
+                        source_record_id=source_record_id,
+                        current_load_record_ids=current_load_record_ids,
+                    )
+                object_attempted += 1
+                total_attempted += 1
+
+            if bulk_buffer is not None:
+                bulk_buffer.flush_target_object(target_object)
+
+        if bulk_buffer is not None:
+            bulk_buffer.flush_target_object(target_object)
+        work_store.reconcile_completed_work(target_object)
+        print(
+            f"Finished {target_object}: attempted={object_attempted}; "
+            f"skipped={object_skipped}; pending={work_store.pending_count(target_object)}"
+        )
+
+    if bulk_buffer is not None:
+        bulk_buffer.flush_all()
+    result_rows.write_error_outputs()
+    result_rows.close()
+    work_store.close()
+    print(
+        f"\nPrepared load complete: attempted={total_attempted}; "
+        f"results={results_csv_path}"
+    )
+    print(f"Failed rows written: {derive_load_output_path(Path(results_csv_path), 'failed_rows')}")
+    print(f"Error summary written: {derive_load_output_path(Path(results_csv_path), 'error_summary')}")
+    return pd.DataFrame()
+
+
 def print_load_sequence(load_objects: List[str]) -> None:
     preview_count = 8
     preview = " -> ".join(load_objects[:preview_count])
@@ -1141,10 +1751,9 @@ def print_load_sequence(load_objects: List[str]) -> None:
         preview += f" -> ... ({len(load_objects)} total objects)"
     print(f"Load sequence: {preview}")
     print(
-        "Resume behavior: SQLite state is used when available. On the first run "
-        "after this change, the loader backfills state from the existing results "
-        "CSV and builds each object's local diff work queue once; later restarts "
-        "read only pending queued work."
+        "Resume behavior: SQLite state is used when available. Preparation "
+        "builds/reconciles local work once per unchanged input set; execution "
+        "reads only pending prepared work."
     )
 
 
@@ -5406,6 +6015,8 @@ class LoadResultRows:
             self.state_conn.execute("DROP TABLE IF EXISTS processed_records")
             self.state_conn.execute("DROP TABLE IF EXISTS load_work_queue")
             self.state_conn.execute("DROP TABLE IF EXISTS load_work_queue_object_status")
+            self.state_conn.execute("DROP TABLE IF EXISTS prepared_load_work")
+            self.state_conn.execute("DROP TABLE IF EXISTS prepared_load_work_object_status")
         state_column_defs = ",\n                ".join(
             f'"{column}" TEXT'
             for column in self.state_columns
@@ -5448,6 +6059,39 @@ class LoadResultRows:
         self.state_conn.execute(
             """
             CREATE TABLE IF NOT EXISTS load_work_queue_object_status (
+                "Target_Object" TEXT PRIMARY KEY,
+                "Status" TEXT NOT NULL,
+                "Signature" TEXT NOT NULL,
+                "Row_Count" INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prepared_load_work (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Target_Object" TEXT NOT NULL,
+                "Source_Object" TEXT NOT NULL,
+                "Source_RecordId" TEXT NOT NULL,
+                "Target_RecordId" TEXT,
+                "Change_Type" TEXT NOT NULL,
+                "Operation" TEXT NOT NULL,
+                "Payload_JSON" TEXT NOT NULL,
+                "Skipped_Fields_JSON" TEXT NOT NULL,
+                "Status" TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE("Target_Object", "Source_RecordId")
+            )
+            """
+        )
+        self.state_conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_prepared_load_work_object_status '
+            'ON prepared_load_work ("Target_Object", "Status", id)'
+        )
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prepared_load_work_object_status (
                 "Target_Object" TEXT PRIMARY KEY,
                 "Status" TEXT NOT NULL,
                 "Signature" TEXT NOT NULL,
@@ -5511,6 +6155,16 @@ class LoadResultRows:
             """,
             (target_object, source_record_id),
         )
+        self.state_conn.execute(
+            """
+            UPDATE prepared_load_work
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            (target_object, source_record_id),
+        )
         self.state_conn.commit()
 
     def mark_work_complete(self, target_object: str, source_record_id: str) -> None:
@@ -5528,6 +6182,48 @@ class LoadResultRows:
             AND "Source_RecordId" = ?
             """,
             (clean_target_object, clean_source_record_id),
+        )
+        self.state_conn.execute(
+            """
+            UPDATE prepared_load_work
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            (clean_target_object, clean_source_record_id),
+        )
+        self.state_conn.commit()
+
+    def mark_work_complete_many(
+        self,
+        target_object: str,
+        source_record_ids: Iterable[str],
+    ) -> None:
+        clean_target_object = normalize_blank(target_object)
+        clean_source_record_ids = [
+            source_record_id
+            for source_record_id in (
+                normalize_blank(source_record_id)
+                for source_record_id in source_record_ids
+            )
+            if source_record_id
+        ]
+        if not clean_target_object or not clean_source_record_ids:
+            return
+
+        self.state_conn.executemany(
+            """
+            UPDATE load_work_queue
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            [
+                (clean_target_object, source_record_id)
+                for source_record_id in clean_source_record_ids
+            ],
         )
         self.state_conn.commit()
 
@@ -5792,6 +6488,49 @@ class LoadResultRows:
                 source_load_value_col: [row[5] for row in rows],
             }
 
+    def iter_pending_work_batches_once(
+        self,
+        target_object: str,
+        source_record_id_col: str,
+        target_record_id_col: str,
+        source_value_col: str,
+        source_load_value_col: str,
+        batch_size: int,
+    ) -> Iterable[Dict[str, List[Any]]]:
+        last_id = 0
+        while True:
+            rows = self.state_conn.execute(
+                """
+                SELECT
+                    id,
+                    "Source_Object",
+                    "Source_RecordId",
+                    "Target_RecordId",
+                    "Change_Type",
+                    "Source_Payload_JSON",
+                    "Source_Load_Payload_JSON"
+                FROM load_work_queue
+                WHERE "Target_Object" = ?
+                AND "Status" = 'pending'
+                AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (target_object, last_id, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+
+            last_id = int(rows[-1][0])
+            yield {
+                "Obj": [row[1] for row in rows],
+                source_record_id_col: [row[2] for row in rows],
+                target_record_id_col: [row[3] for row in rows],
+                "change_type": [row[4] for row in rows],
+                source_value_col: [row[5] for row in rows],
+                source_load_value_col: [row[6] for row in rows],
+            }
+
     def iter_pending_work_part_batches(
         self,
         target_object: str,
@@ -5895,6 +6634,271 @@ class LoadWorkBatch:
         return self.rows
 
 
+class PreparedLoadWorkStore:
+    def __init__(self, results_csv_path: str) -> None:
+        self.results_csv_path = Path(results_csv_path)
+        self.state_db_path = derive_load_state_db_path(self.results_csv_path)
+        self.state_conn = sqlite3.connect(self.state_db_path)
+        self._initialize_tables()
+
+    def _initialize_tables(self) -> None:
+        self.state_conn.execute("PRAGMA journal_mode=WAL")
+        self.state_conn.execute("PRAGMA synchronous=NORMAL")
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prepared_load_work (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Target_Object" TEXT NOT NULL,
+                "Source_Object" TEXT NOT NULL,
+                "Source_RecordId" TEXT NOT NULL,
+                "Target_RecordId" TEXT,
+                "Change_Type" TEXT NOT NULL,
+                "Operation" TEXT NOT NULL,
+                "Payload_JSON" TEXT NOT NULL,
+                "Skipped_Fields_JSON" TEXT NOT NULL,
+                "Status" TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE("Target_Object", "Source_RecordId")
+            )
+            """
+        )
+        self.state_conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_prepared_load_work_object_status '
+            'ON prepared_load_work ("Target_Object", "Status", id)'
+        )
+        self.state_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prepared_load_work_object_status (
+                "Target_Object" TEXT PRIMARY KEY,
+                "Status" TEXT NOT NULL,
+                "Signature" TEXT NOT NULL,
+                "Row_Count" INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.state_conn.commit()
+
+    def object_is_ready(self, target_object: str, signature: str) -> bool:
+        row = self.state_conn.execute(
+            """
+            SELECT "Status", "Signature"
+            FROM prepared_load_work_object_status
+            WHERE "Target_Object" = ?
+            """,
+            (target_object,),
+        ).fetchone()
+        return bool(row and row[0] == "complete" and row[1] == signature)
+
+    def begin_object(self, target_object: str, signature: str) -> None:
+        self.state_conn.execute(
+            'DELETE FROM prepared_load_work WHERE "Target_Object" = ?',
+            (target_object,),
+        )
+        self.state_conn.execute(
+            """
+            INSERT INTO prepared_load_work_object_status
+                ("Target_Object", "Status", "Signature", "Row_Count", updated_at)
+            VALUES (?, 'building', ?, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT("Target_Object") DO UPDATE SET
+                "Status" = 'building',
+                "Signature" = excluded."Signature",
+                "Row_Count" = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (target_object, signature),
+        )
+        self.state_conn.commit()
+
+    def insert_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        self.state_conn.executemany(
+            """
+            INSERT INTO prepared_load_work (
+                "Target_Object",
+                "Source_Object",
+                "Source_RecordId",
+                "Target_RecordId",
+                "Change_Type",
+                "Operation",
+                "Payload_JSON",
+                "Skipped_Fields_JSON",
+                "Status"
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT("Target_Object", "Source_RecordId") DO UPDATE SET
+                "Source_Object" = excluded."Source_Object",
+                "Target_RecordId" = excluded."Target_RecordId",
+                "Change_Type" = excluded."Change_Type",
+                "Operation" = excluded."Operation",
+                "Payload_JSON" = excluded."Payload_JSON",
+                "Skipped_Fields_JSON" = excluded."Skipped_Fields_JSON",
+                "Status" = excluded."Status",
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    row["Target_Object"],
+                    row["Source_Object"],
+                    row["Source_RecordId"],
+                    row.get("Target_RecordId") or "",
+                    row["Change_Type"],
+                    row["Operation"],
+                    row["Payload_JSON"],
+                    row["Skipped_Fields_JSON"],
+                    row["Status"],
+                )
+                for row in rows
+            ],
+        )
+        self.state_conn.commit()
+
+    def finish_object(self, target_object: str, row_count: int) -> None:
+        self.state_conn.execute(
+            """
+            UPDATE prepared_load_work_object_status
+            SET "Status" = 'complete',
+                "Row_Count" = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            """,
+            (row_count, target_object),
+        )
+        self.state_conn.commit()
+        self.reconcile_completed_work(target_object)
+
+    def reconcile_completed_work(self, target_object: Optional[str] = None) -> None:
+        if target_object:
+            self.state_conn.execute(
+                """
+                UPDATE prepared_load_work
+                SET "Status" = 'complete',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE "Target_Object" = ?
+                AND EXISTS (
+                    SELECT 1
+                    FROM processed_records pr
+                    WHERE pr."Target_Object" = prepared_load_work."Target_Object"
+                    AND pr."Source_RecordId" = prepared_load_work."Source_RecordId"
+                )
+                """,
+                (target_object,),
+            )
+        else:
+            self.state_conn.execute(
+                """
+                UPDATE prepared_load_work
+                SET "Status" = 'complete',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM processed_records pr
+                    WHERE pr."Target_Object" = prepared_load_work."Target_Object"
+                    AND pr."Source_RecordId" = prepared_load_work."Source_RecordId"
+                )
+                """
+            )
+        self.state_conn.commit()
+
+    def mark_complete(self, target_object: str, source_record_id: str) -> None:
+        clean_target_object = normalize_blank(target_object)
+        clean_source_record_id = normalize_blank(source_record_id)
+        if not clean_target_object or not clean_source_record_id:
+            return
+        self.state_conn.execute(
+            """
+            UPDATE prepared_load_work
+            SET "Status" = 'complete',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE "Target_Object" = ?
+            AND "Source_RecordId" = ?
+            """,
+            (clean_target_object, clean_source_record_id),
+        )
+        self.state_conn.commit()
+
+    def pending_count(self, target_object: Optional[str] = None) -> int:
+        if target_object:
+            return int(
+                self.state_conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM prepared_load_work
+                    WHERE "Target_Object" = ?
+                    AND "Status" = 'pending'
+                    """,
+                    (target_object,),
+                ).fetchone()[0]
+            )
+        return int(
+            self.state_conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM prepared_load_work
+                WHERE "Status" = 'pending'
+                """
+            ).fetchone()[0]
+        )
+
+    def prepared_count(self, target_object: str) -> int:
+        return int(
+            self.state_conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM prepared_load_work
+                WHERE "Target_Object" = ?
+                """,
+                (target_object,),
+            ).fetchone()[0]
+        )
+
+    def iter_pending_batches(
+        self,
+        target_object: str,
+        batch_size: int,
+    ) -> Iterable[List[Dict[str, Any]]]:
+        while True:
+            rows = self.state_conn.execute(
+                """
+                SELECT
+                    "Target_Object",
+                    "Source_Object",
+                    "Source_RecordId",
+                    "Target_RecordId",
+                    "Change_Type",
+                    "Operation",
+                    "Payload_JSON",
+                    "Skipped_Fields_JSON"
+                FROM prepared_load_work
+                WHERE "Target_Object" = ?
+                AND "Status" = 'pending'
+                ORDER BY id
+                LIMIT ?
+                """,
+                (target_object, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+            yield [
+                {
+                    "Target_Object": row[0],
+                    "Source_Object": row[1],
+                    "Source_RecordId": row[2],
+                    "Target_RecordId": row[3],
+                    "Change_Type": row[4],
+                    "Operation": row[5],
+                    "Payload": parse_json_dict(row[6]),
+                    "Skipped_Fields": parse_json_list(row[7]),
+                }
+                for row in rows
+            ]
+
+    def close(self) -> None:
+        self.state_conn.commit()
+        self.state_conn.close()
+
+
 def derive_load_output_path(results_csv_path: Path, suffix: str) -> Path:
     stem = results_csv_path.stem
     if stem.endswith("_full"):
@@ -5914,6 +6918,150 @@ def queue_json_text(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     text = normalize_blank(value)
     return text if text is not None else "{}"
+
+
+def parse_json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    text = normalize_blank(value)
+    if text is None:
+        return []
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        raise ValueError(f"Expected JSON array, received {type(parsed)}")
+    return parsed
+
+
+def file_signature(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None:
+        return {"path": ""}
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def diff_parts_signature(checkpoint_root: Path, source_objects: List[str]) -> Dict[str, Any]:
+    part_count = 0
+    total_size = 0
+    max_mtime_ns = 0
+    for part_path in iter_record_diff_part_paths(checkpoint_root, source_objects):
+        if not part_path.exists():
+            continue
+        stat = part_path.stat()
+        part_count += 1
+        total_size += stat.st_size
+        max_mtime_ns = max(max_mtime_ns, stat.st_mtime_ns)
+    return {
+        "checkpoint_root": str(checkpoint_root.resolve()),
+        "source_objects": sorted(source_objects),
+        "part_count": part_count,
+        "total_size": total_size,
+        "max_mtime_ns": max_mtime_ns,
+    }
+
+
+def build_prepared_work_signature(
+    target_env: str,
+    source_env: str,
+    target_object: str,
+    source_objects: List[str],
+    checkpoint_root: Path,
+    metadata_path: Path,
+    sequence_path: Path,
+    object_source_policy_path: Optional[Path],
+    source_record_id_col: str,
+    target_record_id_col: str,
+    source_value_col: str,
+    source_load_value_col: str,
+    change_types: Set[str],
+) -> str:
+    return json.dumps(
+        {
+            "target_env": target_env,
+            "source_env": source_env,
+            "target_object": target_object,
+            "diff_parts": diff_parts_signature(checkpoint_root, source_objects),
+            "metadata": file_signature(metadata_path),
+            "sequence": file_signature(sequence_path),
+            "source_policy": file_signature(object_source_policy_path),
+            "source_record_id_col": source_record_id_col,
+            "target_record_id_col": target_record_id_col,
+            "source_value_col": source_value_col,
+            "source_load_value_col": source_load_value_col,
+            "change_types": sorted(change_types),
+            "prepare_version": 1,
+        },
+        sort_keys=True,
+    )
+
+
+def seed_current_load_record_ids_from_result_state(
+    result_rows: LoadResultRows,
+    current_load_record_ids: Dict[Tuple[str, str], str],
+) -> None:
+    try:
+        rows = result_rows.state_conn.execute(
+            """
+            SELECT "Target_Object", "Source_RecordId", "Target_RecordId"
+            FROM processed_records
+            WHERE UPPER("Success") = 'TRUE'
+            AND COALESCE("Target_RecordId", '') != ''
+            AND COALESCE("Source_RecordId", '') != ''
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return
+
+    for target_object, source_record_id, target_record_id in rows:
+        clean_target_object = normalize_blank(target_object)
+        clean_source_record_id = normalize_blank(source_record_id)
+        clean_target_record_id = normalize_blank(target_record_id)
+        if clean_target_object and clean_source_record_id and clean_target_record_id:
+            current_load_record_ids[(clean_target_object, clean_source_record_id)] = clean_target_record_id
+
+
+def preload_prepared_ocr_batch(
+    prepared_batch: List[Dict[str, Any]],
+    relationship_field_defs: Dict[str, Dict[str, Any]],
+    sf,
+    describe_cache: Dict[str, Dict[str, Any]],
+    target_extract_root: Optional[Path],
+    extract_lookup_cache: Dict[str, Dict[str, str]],
+    salesforce_lookup_cache: Dict[Tuple[str, str], Optional[str]],
+    current_load_record_ids: Dict[Tuple[str, str], str],
+    fallback_to_salesforce: bool,
+    opportunity_contact_role_cache: Dict[str, Any],
+) -> None:
+    opportunity_ids: Set[str] = set()
+    for row in prepared_batch:
+        payload = dict(row.get("Payload") or {})
+        skipped_fields: List[str] = []
+        resolve_relationship_payload_to_ids(
+            payload=payload,
+            relationship_field_defs=relationship_field_defs,
+            sf=sf,
+            describe_cache=describe_cache,
+            target_extract_root=target_extract_root,
+            extract_lookup_cache=extract_lookup_cache,
+            salesforce_lookup_cache=salesforce_lookup_cache,
+            current_load_record_ids=current_load_record_ids,
+            skipped_fields=skipped_fields,
+            fallback_to_salesforce=fallback_to_salesforce,
+        )
+        opportunity_id = normalize_blank(payload.get("OpportunityId"))
+        if opportunity_id:
+            opportunity_ids.add(opportunity_id)
+    if opportunity_ids:
+        preload_opportunity_contact_role_cache(
+            sf=sf,
+            opportunity_ids=opportunity_ids,
+            opportunity_contact_role_cache=opportunity_contact_role_cache,
+        )
 
 
 def classify_load_result_error(row: Dict[str, Any]) -> Dict[str, str]:

@@ -1,5 +1,4 @@
-
-
+import csv
 
 """
 Next Steps
@@ -17,7 +16,11 @@ from metadata_diff import compare_salesforce_object_metadata
 from upsert_sequence import generate_upsert_sequence_csv
 from transform import transform_salesforce_diff_for_sf1_load
 from pre_run_cleanup import replace_inactive_owner_ids_in_diff_checkpoints
-from load import load_salesforce_diff_to_target
+from load import (
+    load_prepared_salesforce_work,
+    load_salesforce_diff_to_target,
+    prepare_salesforce_load_work,
+)
 from update_validation_rules import update_validation_rules_with_bypass_permission
 
 """
@@ -104,21 +107,53 @@ replace_inactive_owner_ids_in_diff_checkpoints(
 quit()
 """
 
-""" Load """
-load_results_df = load_salesforce_diff_to_target(
+""" Load: Prepare local work, then execute only pending prepared work """
+SKIP_OBJECTS_FOR_THIS_RUN = {
+    # "OpportunityContactRole",
+}
+
+load_object_filter = None
+if SKIP_OBJECTS_FOR_THIS_RUN:
+    with open("upsert_sequence.csv", newline="", encoding="utf-8-sig") as handle:
+        load_object_filter = [
+            row["Object"].strip()
+            for row in csv.DictReader(handle)
+            if row.get("Enabled", "").strip().upper() == "TRUE"
+            and row.get("Object", "").strip() not in SKIP_OBJECTS_FOR_THIS_RUN
+        ]
+    print(
+        "TEMP RUN: skipping "
+        f"{', '.join(sorted(SKIP_OBJECTS_FOR_THIS_RUN))}. "
+        f"Running {len(load_object_filter)} enabled object(s)."
+    )
+
+prepare_salesforce_load_work(
     target_env="MCUAT8451",
     source_env="PROD",
     diff_checkpoint_dir="diff_diff_parts_prerun_cleaned",
     metadata_scope_csv_path="metadata_scope.csv",
     upsert_sequence_csv_path="upsert_sequence.csv",
     object_source_policy_csv_path="migration_object_source_policy.csv",
+    results_csv_path="load_results_step3_full.csv",
+    object_filter=load_object_filter,
+    resume_from_results=True,
+    rebuild_prepared_work=False,
+    batch_size=50000,
+)
+
+load_results_df = load_prepared_salesforce_work(
+    target_env="MCUAT8451",
+    source_env="PROD",
+    metadata_scope_csv_path="metadata_scope.csv",
+    upsert_sequence_csv_path="upsert_sequence.csv",
+    object_source_policy_csv_path="migration_object_source_policy.csv",
     target_extract_dir="mcuat_extract_parquet",
     results_csv_path="load_results_step3_full.csv",
-    load_step=3,
     resume_from_results=True,
     use_bulk_api=True,
     bulk_batch_size=500,
-    bulk_use_serial=True,
+    bulk_use_serial=False,
+    object_filter=load_object_filter,
 )
 
 quit()
