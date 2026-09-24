@@ -1,0 +1,9 @@
+{
+  "gtm-ai-os-plugin": {
+    "expected_version": "0.1.0"
+  },
+  "gtm-ai-os-core": {
+    "expected_version": "0.1.1",
+    "expected_ref": "gtm_ai_os_core--v0.1.1"
+  }
+}

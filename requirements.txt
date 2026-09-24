@@ -5,3 +5,4 @@ pyarrow
 python-dotenv
 requests
 simple-salesforce
+gtm-ai-os-core @ git+https://github.com/jamesmclane-8451/gtm-ai-os.git@gtm_ai_os_core--v0.1.1#subdirectory=packages/gtm_ai_os_core
