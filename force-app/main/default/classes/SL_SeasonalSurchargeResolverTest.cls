@@ -243,6 +243,68 @@ private class SL_SeasonalSurchargeResolverTest {
     }
 
     @isTest
+    static void testCall_singleMapShapedLine_normalizedToList() {
+        // OmniStudio's Loop Block output collapses to a bare Map (not a
+        // single-element List) when a repeating block produces exactly one
+        // iteration - e.g. a product with only one Billable Account and no
+        // split. This reproduces that exact "lines" shape from the Quote-UI
+        // path (UCM-52679 AC6) and asserts it no longer throws
+        // System.TypeException: Invalid conversion from runtime type
+        // Map<String,ANY> to List<ANY>.
+        Account acct = [SELECT Id FROM Account LIMIT 1];
+        Product2 prod = [SELECT Id FROM Product2 LIMIT 1];
+
+        Map<String, Object> singleLine = new Map<String, Object>{
+            'lineKey' => 'single-line',
+            'accountId' => acct.Id,
+            'productId' => prod.Id,
+            'quantity' => 1
+        };
+        Map<String, Object> input = new Map<String, Object>{ 'lines' => singleLine };
+        Map<String, Object> output = new Map<String, Object>();
+        Map<String, Object> options = new Map<String, Object>();
+        Map<String, Object> args = new Map<String, Object>{
+            'input' => input,
+            'output' => output,
+            'options' => options
+        };
+
+        SL_SeasonalSurchargeResolver resolver = new SL_SeasonalSurchargeResolver();
+
+        Test.startTest();
+        Object callResult = resolver.call('resolveSeasonalSurcharge', args);
+        Test.stopTest();
+
+        System.assertEquals(true, callResult, 'call() should succeed even when "lines" is a bare Map, not a List.');
+        System.assert(output.containsKey('results'), 'output map should still be populated with "results".');
+        List<Object> resultList = (List<Object>) output.get('results');
+        System.assertEquals(1, resultList.size(), 'The single Map-shaped line should normalize to one result entry.');
+    }
+
+    @isTest
+    static void testNormalizeLines_listMapNullAndUnsupportedShape() {
+        System.assertEquals(0, SL_SeasonalSurchargeResolver.normalizeLines(null).size(),
+            'Null input should normalize to an empty list.');
+
+        List<Object> alreadyList = new List<Object>{ new Map<String, Object>{ 'a' => 1 } };
+        System.assertEquals(alreadyList, SL_SeasonalSurchargeResolver.normalizeLines(alreadyList),
+            'A List input should be returned as-is.');
+
+        Map<String, Object> singleMap = new Map<String, Object>{ 'a' => 1 };
+        List<Object> normalized = SL_SeasonalSurchargeResolver.normalizeLines(singleMap);
+        System.assertEquals(1, normalized.size(), 'A single Map input should normalize to a one-element list.');
+        System.assertEquals(singleMap, normalized[0], 'The wrapped element should be the original Map.');
+
+        Boolean threw = false;
+        try {
+            SL_SeasonalSurchargeResolver.normalizeLines('not a map or list');
+        } catch (SL_SeasonalSurchargeResolver.SeasonalSurchargeResolverException ex) {
+            threw = true;
+        }
+        System.assertEquals(true, threw, 'An unsupported "lines" shape should throw a clear typed exception.');
+    }
+
+    @isTest
     static void testCall_unsupportedAction_throws() {
         Map<String, Object> args = new Map<String, Object>{
             'input' => new Map<String, Object>(),
@@ -262,5 +324,28 @@ private class SL_SeasonalSurchargeResolverTest {
         Test.stopTest();
 
         System.assertEquals(true, threw, 'An unrecognized action name must raise a clear typed exception, not fail silently or NPE.');
+    }
+
+    @isTest
+    static void testParseFlightDate_stringAndNullAndDateTimeShapes() {
+        // OmniStudio IP/DataRaptor inputs deserialize dates as plain Strings
+        // (e.g. "2026-07-01"), not Apex DateTime instances - a direct
+        // (DateTime) cast on that String throws System.TypeException at
+        // runtime, which was silently breaking every live OmniScript
+        // invocation of this resolver (UCM-52679 AC6).
+        System.assertEquals(null, SL_SeasonalSurchargeResolver.parseFlightDate(null),
+            'Null input should return null.');
+
+        DateTime fromShortString = SL_SeasonalSurchargeResolver.parseFlightDate('2026-07-01');
+        System.assertEquals(Date.newInstance(2026, 7, 1), fromShortString.dateGmt(),
+            'A plain yyyy-MM-dd String should parse to that calendar date.');
+
+        DateTime original = DateTime.newInstance(2026, 7, 1, 0, 0, 0);
+        System.assertEquals(original, SL_SeasonalSurchargeResolver.parseFlightDate(original),
+            'An actual DateTime input should be returned unchanged.');
+
+        Date originalDate = Date.newInstance(2026, 7, 1);
+        System.assertEquals(originalDate, SL_SeasonalSurchargeResolver.parseFlightDate(originalDate).dateGmt(),
+            'An actual Date input should convert cleanly to DateTime.');
     }
 }

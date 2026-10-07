@@ -72,14 +72,35 @@ public with sharing class SL_SeasonalSurchargeResolver implements System.Callabl
 
     public Boolean invokeMethod(String methodName, Map<String, Object> input, Map<String, Object> output, Map<String, Object> options) {
         if (methodName == 'resolveSeasonalSurcharge') {
-            List<Object> rawLines = input != null && input.get('lines') != null
-                ? (List<Object>) input.get('lines')
-                : new List<Object>();
+            List<Object> rawLines = normalizeLines(input != null ? input.get('lines') : null);
             List<SeasonalSurchargeLineResult> results = resolveLines(rawLines);
             output.put('results', serializeResults(results));
             return true;
         }
         throw new SeasonalSurchargeResolverException('Unsupported action: ' + methodName);
+    }
+
+    // OmniStudio Loop Block output collapses to a bare Map (not a
+    // single-element List) when a repeating block produces exactly one
+    // iteration - e.g. a product with only one Billable Account and no
+    // split. The headless pricing path never hits this because it never
+    // passes through an OmniStudio Loop Block; the Quote-UI path does,
+    // so this normalization is required here specifically for AC6.
+    @TestVisible
+    private static List<Object> normalizeLines(Object rawLines) {
+        if (rawLines == null) {
+            return new List<Object>();
+        }
+        if (rawLines instanceof List<Object>) {
+            return (List<Object>) rawLines;
+        }
+        if (rawLines instanceof Map<String, Object>) {
+            return new List<Object>{ rawLines };
+        }
+        throw new SeasonalSurchargeResolverException(
+            'resolveSeasonalSurcharge received an unsupported "lines" shape: ' +
+            rawLines
+        );
     }
 
     // Invocable, Apex-testable entry point. Kept separate from the
@@ -153,13 +174,40 @@ public with sharing class SL_SeasonalSurchargeResolver implements System.Callabl
         flowInputs.put('Budget', rawLine.get('budget') != null ? (Decimal) rawLine.get('budget') : 0);
         flowInputs.put('IsBudgetBasedQuantity', rawLine.get('isBudgetBasedQuantity') != null ? (Boolean) rawLine.get('isBudgetBasedQuantity') : false);
         flowInputs.put('IsAgencyBilled', rawLine.get('isAgencyBilled') != null ? (Boolean) rawLine.get('isAgencyBilled') : false);
-        flowInputs.put('FlightStartDate', rawLine.get('flightStartDate') != null ? (DateTime) rawLine.get('flightStartDate') : null);
-        flowInputs.put('FlightEndDate', rawLine.get('flightEndDate') != null ? (DateTime) rawLine.get('flightEndDate') : null);
+        flowInputs.put('FlightStartDate', parseFlightDate(rawLine.get('flightStartDate')));
+        flowInputs.put('FlightEndDate', parseFlightDate(rawLine.get('flightEndDate')));
         flowInputs.put('DiscountAmount', rawLine.get('discountAmount') != null ? (Decimal) rawLine.get('discountAmount') : 0);
         flowInputs.put('DiscountPercentage', rawLine.get('discountPercentage') != null ? (Decimal) rawLine.get('discountPercentage') : 0);
         flowInputs.put('AdServerFeesAndSurcharges', rawLine.get('adServerFeesAndSurcharges') != null ? (Decimal) rawLine.get('adServerFeesAndSurcharges') : 0);
         flowInputs.put('RevisedPrice', rawLine.get('revisedPrice') != null ? (Decimal) rawLine.get('revisedPrice') : null);
         return flowInputs;
+    }
+
+    // OmniStudio IP/DataRaptor inputs arrive as JSON-deserialized values -
+    // dates come through as plain Strings (e.g. "2026-07-01"), not Apex
+    // DateTime instances, so a direct (DateTime) cast always throws
+    // System.TypeException at runtime for every OmniScript invocation.
+    @TestVisible
+    private static DateTime parseFlightDate(Object rawValue) {
+        if (rawValue == null) {
+            return null;
+        }
+        if (rawValue instanceof DateTime) {
+            return (DateTime) rawValue;
+        }
+        if (rawValue instanceof Date) {
+            Date d = (Date) rawValue;
+            return DateTime.newInstanceGmt(d.year(), d.month(), d.day());
+        }
+        String rawString = String.valueOf(rawValue);
+        if (String.isBlank(rawString)) {
+            return null;
+        }
+        if (rawString.length() <= 10) {
+            Date d = Date.valueOf(rawString);
+            return DateTime.newInstanceGmt(d.year(), d.month(), d.day());
+        }
+        return (DateTime) JSON.deserialize('"' + rawString + '"', DateTime.class);
     }
 
     private static List<Map<String, Object>> serializeResults(List<SeasonalSurchargeLineResult> results) {
