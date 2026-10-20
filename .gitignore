@@ -6,8 +6,31 @@
 __pycache__/
 *.py[cod]
 
+# Node/Jest tooling (LWC unit tests)
+node_modules/
+coverage/
+
 # Salesforce OAuth token caches
 token_store_*.json
+
+# Cached live-browser session cookies (Playwright UI verification rigs)
+ui_session_cookies_*.json
+clm_prod_session_state.json
+clm_uat_session_state.json
+
+# Corporate CA bundle (exported from local Keychain)
+certs/
+
+# DocuSign CLM credentials
+docusign_clm_private_key.pem
+docusign_clm_secrets.env
+docusign_clm_token.json
+*.pem
+
+# DocuSign production (eSignature) credentials
+docusign_prod_keys/
+docusign_prod_secrets.env
+docusign_prod_token.json
 
 # Large/generated extract outputs
 mcuat_extract.csv
@@ -30,6 +53,11 @@ diff_audit_*.csv
 
 # Large/generated load outputs
 load_results*.csv
+load_results*_state.sqlite
+load_results*_state.sqlite-*
+load_results*_prepared_work/
+prepared_load_work_summary.csv
+load_run_logs/
 pre_run_inactive_owner_replacements.csv
 
 # Runtime/error/audit artifacts
@@ -43,3 +71,9 @@ validation_rule_bypass_backup_*.csv
 *.parquet
 *.feather
 
+# One-time backfill/repair/audit outputs (these have historically grown to
+# hundreds of MB and bloated .git when committed directly)
+one_time_*.csv
+*_results.csv
+*_results_*.csv
+post_load_diff_*.csv
