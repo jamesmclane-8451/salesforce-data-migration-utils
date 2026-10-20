@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "jira": "UCM-52679",
+  "sourceEnvironment": "MCDEV8451",
+  "intendedTargets": [
+    "MCUAT8451"
+  ],
+  "operation": "deploy",
+  "purpose": "Extend seasonal surcharge override-vs-standard resolution (already live on the headless/API pricing path via CalculationProcedureVersion v10 of Master_Media_Pricing_Procedure) to the Quote-UI OmniProcess path ('Opportunity with multiple Accounts' / MultipleAccounts), so AC6 (surcharge applies consistently regardless of entry point) is satisfied. v10 was confirmed to already implement the override logic correctly via live end-to-end testing against 5 scenarios on the headless Flow (SL_8451_Salesforce_Pricing_Endpoint); no CalculationProcedure/ExpressionSet change was needed or made. This manifest covers only the new Quote-UI-side Apex component.",
+  "packageManifest": "manifests/stories/UCM-52679.xml",
+  "components": [
+    {
+      "type": "ApexClass",
+      "name": "SL_SeasonalSurchargeResolver",
+      "action": "create",
+      "description": "System.Callable Remote Action class (pattern follows existing SL_AccessToken precedent). Invokes the existing SL_8451_Salesforce_Pricing_Endpoint Flow (Flow.Interview.createInterview) once per quote line passed in, and returns the ret_Seasonal* and related pricing outputs for the OmniProcess to map onto QuoteLineItem fields (SL_Seasonal_Amount__c, SL_Seasonal_Percentage__c, SL_Seasonal_Override_Percentage__c, SL_Seasonal_Override_Rate_Id__c, SL_Seasonal_Surcharge_Plan_Id__c, SL_Seasonal_Surcharge_Source__c). Enforces a documented per-call line cap (40) as a bulkification guard since each line invokes a full Flow interview with its own SOQL/DML inside the pricing procedure."
+    },
+    {
+      "type": "ApexClass",
+      "name": "SL_SeasonalSurchargeResolverTest",
+      "action": "create",
+      "description": "Unit tests for SL_SeasonalSurchargeResolver: empty/null input, missing-required-field negative paths (captured as a per-line failure, not a thrown exception, so one bad line never blocks the rest of the batch), mixed valid/invalid batch, bulk behavior at the documented 40-line cap, over-cap negative test, and System.Callable call()/invokeMethod() dispatch contract (success and unsupported-action paths). Does not re-verify the underlying pricing procedure's seasonal-surcharge math itself (CalculationProcedureVersion v10) - that was independently verified live against real MCDEV8451 data across 5 scenarios; these tests verify only what this class itself is responsible for: input validation, error isolation per line, the bulk guard, and the Remote Action dispatch contract."
+    }
+  ],
+  "dependencies": [
+    "Existing AutoLaunchedFlow SL_8451_Salesforce_Pricing_Endpoint (active version 301WK00002f8eIzYAI / v32) - not modified by this change, already deployed and active in MCDEV8451.",
+    "Existing CalculationProcedureVersion v10 of Master_Media_Pricing_Procedure (ExpressionSetDefinitionVersion, Status=Active) - not modified by this change, confirmed live-tested and correct for all 5 required scenarios prior to this build."
+  ],
+  "order": [
+    "SL_SeasonalSurchargeResolver",
+    "SL_SeasonalSurchargeResolverTest"
+  ],
+  "accessActivation": "ApexClass components are deployed with status=Active in the metadata (cls-meta.xml). No separate permission-set/profile class-access grant was required for this change in MCDEV8451 (verified: existing running user context used for both execution and test has access to Account/Product2/Opportunity standard objects already in use elsewhere in this org's pricing flow). A subsequent, separate Jira/manifest item is needed to wire a new OmniProcessElement (Type='Remote Action', remoteClass=SL_SeasonalSurchargeResolver, remoteMethod=resolveSeasonalSurcharge) into a new version of the MultipleAccounts OmniProcess (or the create_qouteandorder Integration Procedure) and activate it - OmniProcess/OmniProcessElement records are configuration data in this org's object model (not deployed via this Apex-only package) and are tracked separately once the exact insertion point is confirmed.",
+  "dataSteps": "None. This class performs no DML of its own; all persistence of pricing inputs/outputs onto QuoteLineItem happens via the existing OmniProcess DataRaptor/IP mapping layer once the Remote Action element is wired in (separate manifest item, see accessActivation).",
+  "tests": [
+    "SL_SeasonalSurchargeResolverTest"
+  ],
+  "rollback": "Delete (deactivate) ApexClass SL_SeasonalSurchargeResolver and SL_SeasonalSurchargeResolverTest via destructiveChanges.xml if this change needs to be reverted. No other metadata, data, or configuration is modified by this package, so rollback is a clean removal with no dependent side effects (no OmniProcessElement references this class yet in this deployment).",
+  "validationStatus": "validated (check-only deploy succeeded in MCDEV8451 running SL_SeasonalSurchargeResolverTest)",
+  "deploymentStatus": "deployed to MCDEV8451 (deploy_id 0AfWK00000GT1180AD, status Succeeded, RunSpecifiedTests on SL_SeasonalSurchargeResolverTest; post-deploy retrieve of both ApexClass bodies from MCDEV8451 confirmed to match committed source exactly)"
+}

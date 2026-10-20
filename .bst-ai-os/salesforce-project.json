@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "projectName": "EventBridge",
+  "sourceRoot": "force-app/main/default",
+  "storyManifestDirectory": "manifests/stories",
+  "featureManifestDirectory": "feature-manifests",
+  "sourceEnvironment": "MCDEV8451",
+  "targetEnvironments": [
+    "MCUAT8451"
+  ],
+  "promotionOrder": [
+    "MCDEV8451",
+    "MCUAT8451"
+  ],
+  "requirements": {
+    "checkOnlyBeforeDeploy": true,
+    "destinationBackup": true,
+    "postDeployRetrieveAndCompare": true,
+    "sameCommitAcrossEnvironments": true,
+    "separateDataSteps": true
+  }
+}
